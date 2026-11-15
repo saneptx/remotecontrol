@@ -1,0 +1,133 @@
+//! 通过 SendInput 注入键鼠事件。
+
+use crate::source::InputSink;
+use rc_protocol::InputEvent;
+use std::collections::HashSet;
+use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+};
+
+const XBUTTON1: u32 = 1;
+const XBUTTON2: u32 = 2;
+
+pub struct Injector {
+    /// 被捕获屏幕在虚拟桌面中的 (left, top, width, height)。
+    rect: (i32, i32, u32, u32),
+    keys_down: HashSet<(u16, bool)>,
+    buttons_down: HashSet<u8>,
+}
+
+impl Injector {
+    pub fn new(rect: (i32, i32, u32, u32)) -> Self {
+        Self { rect, keys_down: HashSet::new(), buttons_down: HashSet::new() }
+    }
+
+    fn mouse(&self, dx: i32, dy: i32, data: u32, flags: MOUSE_EVENT_FLAGS) {
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: data, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+        };
+        unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+    }
+
+    fn key(&self, scancode: u16, extended: bool, down: bool) {
+        let mut flags = KEYEVENTF_SCANCODE;
+        if extended {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        if !down {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        let input = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0), wScan: scancode, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+            },
+        };
+        unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+    }
+
+    fn button(&self, button: u8, down: bool) {
+        let (flags, data) = match (button, down) {
+            (0, true) => (MOUSEEVENTF_LEFTDOWN, 0),
+            (0, false) => (MOUSEEVENTF_LEFTUP, 0),
+            (1, true) => (MOUSEEVENTF_RIGHTDOWN, 0),
+            (1, false) => (MOUSEEVENTF_RIGHTUP, 0),
+            (2, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
+            (2, false) => (MOUSEEVENTF_MIDDLEUP, 0),
+            (3, true) => (MOUSEEVENTF_XDOWN, XBUTTON1),
+            (3, false) => (MOUSEEVENTF_XUP, XBUTTON1),
+            (4, true) => (MOUSEEVENTF_XDOWN, XBUTTON2),
+            (4, false) => (MOUSEEVENTF_XUP, XBUTTON2),
+            _ => return,
+        };
+        self.mouse(0, 0, data, flags);
+    }
+}
+
+/// 把屏幕内归一化坐标 (0..=65535) 换算成 SendInput 要求的“虚拟桌面归一化坐标”。
+fn to_virtual(norm: u16, origin: i32, size: u32, v_origin: i32, v_size: i32) -> i32 {
+    let px = origin as i64 + norm as i64 * (size.max(1) as i64 - 1) / 65535;
+    ((px - v_origin as i64) * 65535 / (v_size.max(2) as i64 - 1)) as i32
+}
+
+impl InputSink for Injector {
+    fn inject(&mut self, ev: InputEvent) {
+        match ev {
+            InputEvent::MouseMoveAbs { x, y } => {
+                let (left, top, w, h) = self.rect;
+                let (vx, vy, vw, vh) = unsafe {
+                    (
+                        GetSystemMetrics(SM_XVIRTUALSCREEN),
+                        GetSystemMetrics(SM_YVIRTUALSCREEN),
+                        GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                        GetSystemMetrics(SM_CYVIRTUALSCREEN),
+                    )
+                };
+                self.mouse(
+                    to_virtual(x, left, w, vx, vw),
+                    to_virtual(y, top, h, vy, vh),
+                    0,
+                    MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                );
+            }
+            InputEvent::MouseButton { button, down } => {
+                if down {
+                    self.buttons_down.insert(button);
+                } else {
+                    self.buttons_down.remove(&button);
+                }
+                self.button(button, down);
+            }
+            InputEvent::Wheel { dx, dy } => {
+                if dy != 0 {
+                    self.mouse(0, 0, dy as i32 as u32, MOUSEEVENTF_WHEEL);
+                }
+                if dx != 0 {
+                    self.mouse(0, 0, dx as i32 as u32, MOUSEEVENTF_HWHEEL);
+                }
+            }
+            InputEvent::Key { scancode, extended, down } => {
+                if down {
+                    self.keys_down.insert((scancode, extended));
+                } else {
+                    self.keys_down.remove(&(scancode, extended));
+                }
+                self.key(scancode, extended, down);
+            }
+        }
+    }
+}
+
+impl Drop for Injector {
+    /// 连接断开时松开所有仍按下的键，避免被控端出现“卡键”。
+    fn drop(&mut self) {
+        for &(scancode, extended) in &self.keys_down {
+            self.key(scancode, extended, false);
+        }
+        for &b in &self.buttons_down {
+            self.button(b, false);
+        }
+    }
+}

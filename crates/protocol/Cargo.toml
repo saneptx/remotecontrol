@@ -1,0 +1,11 @@
+[package]
+name = "rc-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.2"

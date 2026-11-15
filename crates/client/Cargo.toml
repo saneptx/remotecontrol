@@ -1,0 +1,16 @@
+[package]
+name = "rc-client"
+version.workspace = true
+edition.workspace = true
+description = "控制端（macOS）：硬件解码显示远端画面，回传键鼠输入"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+socket2.workspace = true
+rc-protocol.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = "0.30"
+objc2 = "0.6"
+objc2-foundation = "0.3"

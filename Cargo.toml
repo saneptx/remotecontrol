@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/protocol", "crates/host", "crates/client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+socket2 = "0.5"
+rc-protocol = { path = "crates/protocol" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# 调试构建也要保证收发路径够快
+[profile.dev]
+opt-level = 1
