@@ -3,6 +3,7 @@
 use crate::source::InputSink;
 use rc_protocol::InputEvent;
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -16,11 +17,21 @@ pub struct Injector {
     rect: (i32, i32, u32, u32),
     keys_down: HashSet<(u16, bool)>,
     buttons_down: HashSet<u8>,
+    last_desktop_check: Instant,
+}
+
+/// 发送输入；若因桌面已切换（例如进入锁屏）而失败，切到新的输入桌面后重试一次。
+fn send(inputs: &[INPUT]) {
+    unsafe {
+        if SendInput(inputs, size_of::<INPUT>() as i32) == 0 && super::desktop::sync_thread() {
+            SendInput(inputs, size_of::<INPUT>() as i32);
+        }
+    }
 }
 
 impl Injector {
     pub fn new(rect: (i32, i32, u32, u32)) -> Self {
-        Self { rect, keys_down: HashSet::new(), buttons_down: HashSet::new() }
+        Self { rect, keys_down: HashSet::new(), buttons_down: HashSet::new(), last_desktop_check: Instant::now() - Duration::from_secs(1) }
     }
 
     fn mouse(&self, dx: i32, dy: i32, data: u32, flags: MOUSE_EVENT_FLAGS) {
@@ -28,7 +39,7 @@ impl Injector {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: data, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
         };
-        unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+        send(&[input]);
     }
 
     fn key(&self, scancode: u16, extended: bool, down: bool) {
@@ -45,7 +56,7 @@ impl Injector {
                 ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0), wScan: scancode, dwFlags: flags, time: 0, dwExtraInfo: 0 },
             },
         };
-        unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+        send(&[input]);
     }
 
     fn button(&self, button: u8, down: bool) {
@@ -72,7 +83,8 @@ pub fn nudge_mouse() {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy: 0, mouseData: 0, dwFlags: MOUSEEVENTF_MOVE, time: 0, dwExtraInfo: 0 } },
     };
-    unsafe { SendInput(&[mv(1), mv(-1)], size_of::<INPUT>() as i32) };
+    super::desktop::sync_thread();
+    send(&[mv(1), mv(-1)]);
 }
 
 /// 把屏幕内归一化坐标 (0..=65535) 换算成 SendInput 要求的“虚拟桌面归一化坐标”。
@@ -83,6 +95,11 @@ fn to_virtual(norm: u16, origin: i32, size: u32, v_origin: i32, v_size: i32) -> 
 
 impl InputSink for Injector {
     fn inject(&mut self, ev: InputEvent) {
+        // SendInput 跨桌面时不一定报错（会被静默丢弃），所以也定期主动检查一次。
+        if self.last_desktop_check.elapsed() > Duration::from_millis(200) {
+            self.last_desktop_check = Instant::now();
+            super::desktop::sync_thread();
+        }
         match ev {
             InputEvent::MouseMoveAbs { x, y } => {
                 let (left, top, w, h) = self.rect;

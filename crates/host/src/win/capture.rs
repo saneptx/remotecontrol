@@ -44,6 +44,7 @@ impl Capturer {
         unsafe {
             // 不声明 DPI 感知的话，坐标和尺寸会被系统缩放。
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            super::desktop::sync_thread();
 
             let factory: IDXGIFactory1 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
             // 取第一块接有显示器的显卡的第一个输出（通常就是主显示器）。
@@ -76,7 +77,7 @@ impl Capturer {
             let dup = match output.DuplicateOutput(&device) {
                 Ok(d) => d,
                 Err(e) if e.code() == E_ACCESSDENIED => {
-                    bail!("远端处于锁屏或 UAC 安全桌面，当前权限无法采集（需以系统服务运行）")
+                    bail!("远端处于锁屏或 UAC 界面，当前权限无法采集（用 rc-host install 安装为系统服务即可解决）")
                 }
                 Err(e) => return Err(e).context("DuplicateOutput（是否有其它程序独占了屏幕采集？）"),
             };
@@ -154,7 +155,11 @@ impl Capturer {
         unsafe {
             let Some(dup) = self.dup.clone() else {
                 // 上次丢失了访问权（锁屏/UAC/显示器关闭/切换分辨率），尝试重建。
-                std::thread::sleep(Duration::from_millis(timeout_ms.clamp(10, 50) as u64));
+                // 桌面切换时先跟过去（服务模式下才有权限进入锁屏所在的安全桌面）。
+                let switched = super::desktop::sync_thread();
+                if !switched {
+                    std::thread::sleep(Duration::from_millis(timeout_ms.clamp(10, 50) as u64));
+                }
                 match self.output.DuplicateOutput(&self.device) {
                     Ok(dup) => {
                         let desc = dup.GetDesc();
@@ -163,6 +168,11 @@ impl Capturer {
                         }
                         self.dup = Some(dup);
                         self.set_state(State::Ok);
+                    }
+                    // 刚切换了桌面却仍然失败：旧设备可能不能跨桌面使用，立即整体重建，别再等。
+                    Err(_) if switched => {
+                        self.set_state(State::Unavailable);
+                        self.lost_since = Some(Instant::now() - Duration::from_secs(10));
                     }
                     Err(e) if e.code() == E_ACCESSDENIED => self.set_state(State::SecureDesktop),
                     Err(_) => self.set_state(State::Unavailable),

@@ -1,9 +1,11 @@
 //! Windows 被控端：DXGI Desktop Duplication 采集 → NVENC HEVC 4:4:4 编码，全程显存内零拷贝。
 
 mod capture;
+mod desktop;
 pub mod input;
 mod nvenc;
 pub mod power;
+pub mod service;
 
 use crate::source::{EncodedFrame, VideoSource};
 use crate::{now_us, Args};
@@ -162,7 +164,7 @@ impl VideoSource for WinSource {
 
         self.notice = match p.cap.state() {
             State::Ok => None,
-            State::SecureDesktop => Some("远端处于锁屏或 UAC 安全桌面，当前权限无法采集和操作（需以系统服务运行）".into()),
+            State::SecureDesktop => Some("远端处于锁屏或 UAC 界面，当前权限无法采集和操作（用 rc-host install 安装为系统服务即可解决）".into()),
             State::Unavailable => Some("远端显示器不可用（可能已关闭），正在重试…".into()),
         };
         if p.cap.needs_rebuild() {

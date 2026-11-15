@@ -9,7 +9,7 @@ mod nvenc_sys;
 mod win;
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rc_protocol::{self as proto, video, ClientMsg, HostMsg};
 use source::{InputSink, VideoSource};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -17,15 +17,34 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-#[derive(Parser, Debug, Clone)]
-#[command(about = "局域网远程控制 - 被控端")]
+#[derive(Parser, Debug)]
+#[command(about = "局域网远程控制 - 被控端", args_conflicts_with_subcommands = true)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+    #[command(flatten)]
+    args: Args,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// 安装为 Windows 系统服务：开机自启，可控制锁屏、登录界面与 UAC 弹窗（需要管理员权限）
+    Install(Args),
+    /// 卸载系统服务（需要管理员权限）
+    Uninstall,
+    /// 由 Windows 服务管理器调用，请勿手动运行
+    #[command(hide = true)]
+    Service(Args),
+}
+
+#[derive(clap::Args, Debug, Clone)]
 pub struct Args {
     /// 监听端口（TCP 控制通道）
     #[arg(long, default_value_t = proto::DEFAULT_PORT)]
-    port: u16,
-    /// 连接密码；不指定则每次启动随机生成
+    pub port: u16,
+    /// 连接密码；不指定则随机生成（服务模式下首次安装时生成并保存）
     #[arg(long, env = "RC_PASSWORD")]
-    password: Option<String>,
+    pub password: Option<String>,
     /// 目标码率（Mbps）。4:4:4 下 1080p 建议 50+，4K 建议 100+
     #[arg(long, default_value_t = 80)]
     pub bitrate: u32,
@@ -34,13 +53,13 @@ pub struct Args {
     pub fps: Option<u32>,
     /// 前向纠错冗余比例（%）。Wi-Fi 下建议 20 以上，有线网络可降到 5～10，0 为关闭
     #[arg(long, default_value_t = 20)]
-    fec: u32,
+    pub fec: u32,
     /// 允许系统按电源设置进入睡眠（默认被控端运行期间阻止睡眠，否则睡眠后无法连接）
     #[arg(long)]
-    allow_sleep: bool,
+    pub allow_sleep: bool,
     /// 测试用：随机丢弃该比例（%）的视频包，模拟网络丢包
     #[arg(long, hide = true, default_value_t = 0.0)]
-    sim_loss: f64,
+    pub sim_loss: f64,
 }
 
 /// 进程启动以来的微秒数；采集时间戳与 Pong 共用这一时钟。
@@ -49,25 +68,56 @@ pub fn now_us() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_micros() as u64
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+/// 去掉易混淆字符的 8 位随机口令。
+pub fn generate_password() -> String {
+    const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+    proto::random_nonce()[..8].iter().map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char).collect()
+}
+
+fn validate(args: &Args) -> Result<()> {
     if args.fps == Some(0) || args.bitrate == 0 {
         bail!("--fps 和 --bitrate 必须大于 0");
     }
     if args.fec > 200 {
         bail!("--fec 不能超过 200");
     }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        None => {
+            validate(&cli.args)?;
+            run_host(cli.args)
+        }
+        #[cfg(windows)]
+        Some(Cmd::Install(args)) => {
+            validate(&args)?;
+            win::service::install(&args)
+        }
+        #[cfg(windows)]
+        Some(Cmd::Uninstall) => win::service::uninstall(),
+        #[cfg(windows)]
+        Some(Cmd::Service(args)) => win::service::run(args),
+        #[cfg(not(windows))]
+        Some(_) => bail!("系统服务只支持 Windows"),
+    }
+}
+
+fn run_host(args: Args) -> Result<()> {
     now_us();
     #[cfg(windows)]
     win::power::init(!args.allow_sleep);
-    let password = args.password.clone().unwrap_or_else(|| {
-        // 去掉易混淆字符的 8 位随机口令
-        const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
-        proto::random_nonce()[..8].iter().map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char).collect()
-    });
+    let generated = args.password.is_none();
+    let password = args.password.clone().unwrap_or_else(generate_password);
 
-    let listener = TcpListener::bind(("0.0.0.0", args.port)).with_context(|| format!("监听端口 {} 失败", args.port))?;
-    println!("被控端已启动，端口 {}，连接密码: {}", args.port, password);
+    let listener = TcpListener::bind(("0.0.0.0", args.port)).with_context(|| format!("监听端口 {} 失败（是否已有被控端或系统服务在运行？）", args.port))?;
+    if generated {
+        println!("被控端已启动，端口 {}，连接密码: {}", args.port, password);
+    } else {
+        println!("被控端已启动，端口 {}（使用已配置的密码）", args.port);
+    }
     println!("等待控制端连接…");
 
     for stream in listener.incoming() {

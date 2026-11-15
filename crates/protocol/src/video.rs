@@ -190,7 +190,7 @@ impl Reassembler {
         let total = data_count as usize + parity_count as usize;
         if data_count == 0
             || idx as usize >= total
-            || shard_size % 2 != 0
+            || !shard_size.is_multiple_of(2)
             || frame_len as usize > data_count as usize * shard_size
         {
             return Output::Pending;

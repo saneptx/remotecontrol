@@ -24,8 +24,39 @@
 - 最新构建：仓库的 **Actions** 页 → 最近一次成功的 `build` → 页面底部 Artifacts 里的 `rc-host-windows-x64`
 - 正式版本：推送 `v*` 标签（如 `git tag v0.1.0 && git push origin v0.1.0`）后会自动发布到 **Releases**
 
-`rc-host.exe` 是单个文件，不需要安装任何运行库，双击即可运行（需要 NVIDIA 显卡与较新驱动）。
-首次运行时 Windows 防火墙会弹窗，选择允许“专用网络”。
+`rc-host.exe` 是单个文件，不需要安装任何运行库（需要 NVIDIA 显卡与较新驱动）。两种用法：
+
+- **临时使用**：双击 `rc-host.exe`，窗口里显示连接密码。首次运行时防火墙会弹窗，选择允许“专用网络”。
+  这种方式看不到也操作不了锁屏和 UAC 弹窗。
+- **安装为系统服务（推荐）**：双击 `install-service.cmd`（会请求管理员权限）。之后开机自动运行，
+  锁屏、登录界面、UAC 弹窗和以管理员身份运行的程序都能正常显示和操作。详见下文。
+
+## 系统服务模式
+
+```
+rc-host.exe install [--password 密码] [--port 47800] [--bitrate 80] [--fps 60] [--fec 20]
+rc-host.exe uninstall
+```
+
+需要在管理员终端里执行（或直接双击 `install-service.cmd` / `uninstall-service.cmd`）。`install` 会：
+
+1. 把程序复制到 `C:\Program Files\RemoteControl\`；
+2. 保存连接密码到 `C:\ProgramData\RemoteControl\password.txt`（仅 SYSTEM 和管理员可读）。
+   不指定 `--password` 时首次安装随机生成，之后重新安装会沿用原密码；
+3. 添加防火墙入站规则（专用 / 域网络）；
+4. 注册并启动开机自启的系统服务，崩溃后自动重启。
+
+修改密码或参数：带上新参数重新执行 `install`。升级版本：用新版 exe 重新执行 `install`。
+
+运行日志在 `C:\ProgramData\RemoteControl\host.log`（需要管理员权限查看）。
+
+**原理**：服务运行在看不到屏幕的 session 0 里，它在当前登录会话中以 SYSTEM 身份启动工作进程；
+SYSTEM 身份可以进入锁屏 / UAC 所在的安全桌面，工作进程在桌面切换时自动跟随，继续采集和注入输入。
+
+**注意**：
+- 用户注销或切换用户时，服务会在新会话里重启工作进程，控制端需要重新连接。
+- 不支持发送 Ctrl+Alt+Del（Windows 不允许模拟）。如果锁屏要求先按 Ctrl+Alt+Del，请在本机组策略中关闭该要求。
+- 如果 Windows 把当前网络识别为“公用网络”，防火墙规则不生效，请把网络改为“专用网络”。
 
 ## 构建与运行
 
@@ -78,8 +109,7 @@ target/release/rc-client 192.168.1.20 -p <密码>
 - 画面里没有远端鼠标指针（Desktop Duplication 不含指针），目前靠本地指针定位，指针形状不会跟随变化。
 - NVENC 内部的 RGB→YUV 转换是 8 bit BT.601 limited range，属于“视觉近无损”而非逐像素一致。
 - 只采集主显示器；混合显卡笔记本（显示器接在核显上）暂不支持。
-- **锁屏界面与 UAC 弹窗看不到也操作不了**（窗口标题会提示）：普通权限的程序无权访问安全桌面，需要以系统服务方式运行才能解决。
-  在此之前，如果希望熄屏后能直接唤醒使用，请在 Windows“设置 → 账户 → 登录选项”里把“你离开后，Windows 应在何时要求你重新登录”设为“从不”。
+- 直接双击运行时看不到锁屏界面与 UAC 弹窗（窗口标题会提示），请安装为系统服务。
 - macOS 的系统级快捷键（Cmd+Tab、Cmd+Space、Mission Control 等）会被本机截获，发不到远端。
 - 视频流未加密，仅适用于可信局域网。
 - 无音频、剪贴板、文件传输。
