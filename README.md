@@ -5,7 +5,7 @@
 | | 实现 |
 |---|---|
 | 采集 | DXGI Desktop Duplication（画面无变化时不发送任何数据） |
-| 编码 | NVENC HEVC **4:4:4**，P1 预设 + 超低延迟调优，无 B 帧，CBR + 单帧 VBV，显存内零拷贝；按控制端窗口的实际像素尺寸在显卡上缩小后再编码 |
+| 编码 | HEVC 4:2:0（Windows：NVENC；Mac：VideoToolbox），超低延迟设置，无 B 帧，CBR + 单帧 VBV，显存内零拷贝；按控制端窗口的实际像素尺寸在显卡上缩小后再编码 |
 | 传输 | 视频走 UDP（≤1400 字节分片 + Reed-Solomon 前向纠错，零星丢包直接还原，不重传）；控制走 TCP_NODELAY |
 | 解码显示 | VideoToolbox 硬解 + AVSampleBufferDisplayLayer，解完立即上屏，不缓冲 |
 | 输入 | 绝对坐标鼠标、滚轮、扫描码键盘，经 SendInput 注入 |
@@ -37,7 +37,7 @@
 ## 系统服务模式
 
 ```
-rc-host.exe install [--name 书房电脑] [--port 47800] [--bitrate 80] [--fps 60] [--fec 20]
+rc-host.exe install [--name 书房电脑] [--port 47800] [--bitrate 40] [--fps 60] [--fec 20]
 rc-host.exe uninstall
 rc-host.exe devices            # 列出已配对的控制端
 rc-host.exe forget <名称>       # 删除已配对的控制端（--all 删除全部）
@@ -141,12 +141,12 @@ packaging/macos/make-app.sh            # 生成 target/RemoteControl.app
 - 不开串流时先 `ping` 一下被控端：如果 RTT 本身就忽高忽低，问题在网络，不在本程序。
 
 没有 Windows 机器时，可在 macOS 上直接运行 `rc-host`（需要带 libx265 的 ffmpeg），
-它会推送一路 HEVC 4:4:4 测试图像，用来联调控制端。
+它会推送一路 HEVC 测试图像，用来联调控制端。
 
 ## 已知限制
 
 - 画面里没有远端鼠标指针（Desktop Duplication 不含指针），目前靠本地指针定位，指针形状不会跟随变化。
-- NVENC 内部的 RGB→YUV 转换是 8 bit BT.601 limited range，属于“视觉近无损”而非逐像素一致。
+- 画面统一为 HEVC 4:2:0（8 bit）：彩色细节（例如彩色小字的边缘）比 4:4:4 略软，换来约一半的码率，且两个方向的硬件编解码器都支持。
 - 只采集主显示器；混合显卡笔记本（显示器接在核显上）暂不支持。
 - 直接双击运行时看不到锁屏界面与 UAC 弹窗（窗口标题会提示），请安装为系统服务。
 - macOS 的系统级快捷键（Cmd+Tab、Cmd+Space、Mission Control 等）会被本机截获，发不到远端。

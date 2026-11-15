@@ -60,8 +60,8 @@ pub struct Args {
     /// 本机在控制端设备列表里显示的名称（默认为计算机名）
     #[arg(long)]
     pub name: Option<String>,
-    /// 目标码率（Mbps）。4:4:4 下 1080p 建议 50+，4K 建议 100+
-    #[arg(long, default_value_t = 80)]
+    /// 目标码率（Mbps）。默认 40，局域网有线可提高到 60～80 换取更清晰的快速运动画面
+    #[arg(long, default_value_t = 40)]
     pub bitrate: u32,
     /// 最高帧率；默认跟随显示器刷新率
     #[arg(long)]

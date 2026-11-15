@@ -1,4 +1,4 @@
-//! NVENC HEVC 4:4:4 超低延迟编码。输入是已注册的 D3D11 BGRA 纹理，输出 Annex-B 码流。
+//! NVENC HEVC 4:2:0（Main）超低延迟编码。输入是已注册的 D3D11 BGRA 纹理，输出 Annex-B 码流。
 //!
 //! 配置要点：P1 预设 + ULTRA_LOW_LATENCY 调优、无 B 帧、无限 GOP（只在请求时出 IDR）、
 //! CBR 且 VBV 只有一帧大小——每帧大小稳定，网络侧不会出现突发排队。
@@ -99,7 +99,8 @@ impl Encoder {
 
         let mut config: Box<NV_ENC_CONFIG> = Box::new(preset_cfg.presetCfg);
         config.version = NV_ENC_CONFIG_VER;
-        config.profileGUID = NV_ENC_HEVC_PROFILE_FREXT_GUID; // 4:4:4 需要 Range Extensions
+        // 两个方向统一用 4:2:0：码率更低，Mac 的硬件编码器和各家硬件解码器都支持
+        config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
         config.gopLength = NVENC_INFINITE_GOPLENGTH;
         config.frameIntervalP = 1; // 无 B 帧
 
@@ -112,7 +113,7 @@ impl Encoder {
         rc.vbvInitialDelay = rc.vbvBufferSize;
 
         let hevc = &mut config.encodeCodecConfig.hevcConfig;
-        hevc.set_chromaFormatIDC(3); // YUV 4:4:4
+        hevc.set_chromaFormatIDC(1); // YUV 4:2:0（BGRA → YUV 的转换在 NVENC 内部完成）
         hevc.set_repeatSPSPPS(1); // 每个 IDR 都带参数集，控制端可随时加入
         hevc.idrPeriod = NVENC_INFINITE_GOPLENGTH;
         // NVENC 内部把 BGRA 按 BT.601 limited 转成 YUV；在 VUI 里如实声明，解码端才能精确还原。
@@ -143,7 +144,7 @@ impl Encoder {
         init.encodeConfig = &mut *config;
         check(
             api.nvEncInitializeEncoder.context("nvEncInitializeEncoder")?(self.enc, &mut *init),
-            "InitializeEncoder（该显卡可能不支持 HEVC 4:4:4 编码，需要 GTX 10 系及以上）",
+            "InitializeEncoder（该显卡可能不支持 HEVC 编码，需要 GTX 950 / 10 系及以上）",
         )?;
 
         let mut bs = NV_ENC_CREATE_BITSTREAM_BUFFER { version: NV_ENC_CREATE_BITSTREAM_BUFFER_VER, ..Default::default() };

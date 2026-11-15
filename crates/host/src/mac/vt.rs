@@ -1,7 +1,6 @@
 //! VideoToolbox HEVC 硬件编码：实时、无 B 帧、只在请求时出关键帧，输出 Annex-B（关键帧带 VPS/SPS/PPS）。
 //!
-//! Mac 的硬件编码器不支持 HEVC 4:4:4（只有 4:2:0 和 4:2:2 10 bit），而 Windows 控制端
-//! 常见的 NVIDIA 解码器不支持 4:2:2，所以这里用 4:2:0（Main）。
+//! 两个方向统一用 HEVC 4:2:0（Main）：码率低，各家硬件编解码器都支持。
 
 use anyhow::{bail, Result};
 use std::ffi::c_void;

@@ -1,4 +1,4 @@
-//! 非 Windows 平台上的测试图像源：用 ffmpeg 命令行生成 HEVC 4:4:4 测试码流，
+//! 测试图像源：用 ffmpeg 命令行生成 HEVC 4:2:0 测试码流，
 //! 用于在没有 Windows 机器时联调协议与控制端。
 
 use crate::source::{EncodedFrame, InputSink, VideoSource};
@@ -26,8 +26,7 @@ impl TestSource {
         let mut child = Command::new("ffmpeg")
             .args(["-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i"])
             .arg(format!("testsrc2=size={WIDTH}x{HEIGHT}:rate={fps}"))
-            // RC_TEST_420=1：输出 4:2:0（Windows 控制端的系统解码器不支持 4:4:4）
-            .args(["-pix_fmt", if std::env::var("RC_TEST_420").is_ok_and(|v| v == "1") { "yuv420p" } else { "yuv444p" }])
+            .args(["-pix_fmt", "yuv420p"])
             .args(["-c:v", "libx265", "-preset", "ultrafast", "-tune", "zerolatency"])
             .args(["-b:v", &format!("{}M", args.bitrate.min(30))])
             .args(["-x265-params", &format!("keyint={fps}:min-keyint={fps}:repeat-headers=1:aud=1:log-level=error")])

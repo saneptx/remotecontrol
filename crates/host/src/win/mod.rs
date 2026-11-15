@@ -1,4 +1,4 @@
-//! Windows 被控端：DXGI Desktop Duplication 采集 → NVENC HEVC 4:4:4 编码，全程显存内零拷贝。
+//! Windows 被控端：DXGI Desktop Duplication 采集 → NVENC HEVC 编码，全程显存内零拷贝。
 
 mod capture;
 pub mod cliphelper;
@@ -163,7 +163,7 @@ impl WinSource {
             }
         };
         let cap = &pipe.cap;
-        println!("采集 {}x{} @ {}Hz，NVENC HEVC 4:4:4，{} Mbps，上限 {} fps", cap.width, cap.height, cap.refresh_hz, args.bitrate, fps);
+        println!("采集 {}x{} @ {}Hz，NVENC HEVC 4:2:0，{} Mbps，上限 {} fps", cap.width, cap.height, cap.refresh_hz, args.bitrate, fps);
         let min_interval = Duration::from_secs_f64(0.9 / fps as f64);
         Ok(Self {
             width: cap.width,
