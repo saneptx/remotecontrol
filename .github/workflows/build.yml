@@ -31,12 +31,16 @@ jobs:
           $deps = & $dumpbin.FullName /dependents target\release\rc-host.exe | Out-String
           Write-Output $deps
           if ($deps -match 'VCRUNTIME|MSVCP|api-ms-win-crt') { throw "rc-host.exe 仍依赖 C 运行库" }
+      # exe 与安装脚本放在同一目录（脚本按自身所在目录查找 rc-host.exe）
+      - name: 打包
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/rc-host.exe, packaging/windows/*.cmd dist/
       - uses: actions/upload-artifact@v4
         with:
           name: rc-host-windows-x64
-          path: |
-            target/release/rc-host.exe
-            packaging/windows/*.cmd
+          path: dist/
           if-no-files-found: error
 
   macos-client:
