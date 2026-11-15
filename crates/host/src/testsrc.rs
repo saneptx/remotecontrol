@@ -13,6 +13,7 @@ const HEIGHT: u32 = 1080;
 
 pub struct TestSource {
     child: Child,
+    fps: u32,
     stdout: ChildStdout,
     buf: Vec<u8>,
     /// 已扫描过、确定不含下一个 AUD 的前缀长度。
@@ -21,7 +22,7 @@ pub struct TestSource {
 
 impl TestSource {
     pub fn new(args: &Args) -> Result<Self> {
-        let fps = args.fps;
+        let fps = args.fps.unwrap_or(60);
         let mut child = Command::new("ffmpeg")
             .args(["-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i"])
             .arg(format!("testsrc2=size={WIDTH}x{HEIGHT}:rate={fps}"))
@@ -34,13 +35,17 @@ impl TestSource {
             .spawn()
             .context("启动 ffmpeg 失败（测试图像源需要 PATH 中有带 libx265 的 ffmpeg）")?;
         let stdout = child.stdout.take().unwrap();
-        Ok(Self { child, stdout, buf: Vec::new(), scanned: 0 })
+        Ok(Self { child, fps, stdout, buf: Vec::new(), scanned: 0 })
     }
 }
 
 impl VideoSource for TestSource {
     fn size(&self) -> (u32, u32) {
         (WIDTH, HEIGHT)
+    }
+
+    fn fps(&self) -> u32 {
+        self.fps
     }
 
     // 命令行编码器无法按需插入关键帧，这里靠 1 秒一个的周期关键帧恢复。

@@ -30,9 +30,11 @@ pub fn connect(host: &str, password: &str) -> Result<Connection> {
     // 被控端初始化编码器可能要一两秒
     tcp.set_read_timeout(Some(Duration::from_secs(15)))?;
 
-    // 视频帧是突发到达的（一帧上百个包），接收缓冲区要足够大。
     let udp = UdpSocket::bind("0.0.0.0:0")?;
-    socket2::SockRef::from(&udp).set_recv_buffer_size(8 << 20).ok();
+    let rcvbuf = enlarge_recv_buffer(&udp);
+    if rcvbuf < 2 << 20 {
+        eprintln!("警告：UDP 接收缓冲区只有 {} KB，关键帧可能丢包", rcvbuf / 1024);
+    }
     udp.set_read_timeout(Some(Duration::from_millis(100)))?;
 
     let client_nonce = proto::random_nonce();
@@ -52,6 +54,19 @@ pub fn connect(host: &str, password: &str) -> Result<Connection> {
         HostMsg::Reject { reason } => bail!("被控端拒绝连接: {reason}"),
         other => bail!("握手失败: {other:?}"),
     }
+}
+
+/// 视频帧是突发到达的（关键帧一次上千个包），接收缓冲区要足够大。
+/// macOS 上限由 kern.ipc.maxsockbuf 决定（默认 8MB，实际可用略少），请求过大会直接失败，
+/// 所以从大到小逐级尝试。返回最终生效的大小。
+fn enlarge_recv_buffer(udp: &UdpSocket) -> usize {
+    let sock = socket2::SockRef::from(udp);
+    for mb in [16usize, 8, 7, 6, 4, 2] {
+        if sock.set_recv_buffer_size(mb << 20).is_ok() {
+            break;
+        }
+    }
+    sock.recv_buffer_size().unwrap_or(0)
 }
 
 /// 控制通道的写端，多线程共享。
@@ -75,6 +90,8 @@ pub struct Shared {
     /// 被控端时钟 - 本地时钟（微秒），由心跳估算。
     clock_offset_us: AtomicI64,
     rtt_us: AtomicU64,
+    /// 被控端发来的状态提示。
+    pub notice: Mutex<Option<String>>,
 }
 
 /// 读控制通道：处理 Pong 估算时钟差；连接断开时调用 `on_closed`。
@@ -82,7 +99,13 @@ pub fn spawn_control_reader(mut tcp: TcpStream, shared: Arc<Shared>, on_closed: 
     std::thread::spawn(move || {
         let mut best_rtt = u64::MAX;
         while let Ok(msg) = proto::read_msg::<HostMsg>(&mut tcp) {
-            if let HostMsg::Pong { t_us, host_us } = msg {
+            if let HostMsg::Notice { text } = msg {
+                match &text {
+                    Some(t) => eprintln!("被控端: {t}"),
+                    None => eprintln!("被控端: 画面已恢复"),
+                }
+                *shared.notice.lock().unwrap() = text;
+            } else if let HostMsg::Pong { t_us, host_us } = msg {
                 let rtt = now_us().saturating_sub(t_us);
                 shared.rtt_us.store(rtt, Ordering::Relaxed);
                 // 往返最短的那次样本最接近“对称延迟”假设，用它估算时钟差；
@@ -111,10 +134,24 @@ pub fn spawn_pinger(control: Control, shared: Arc<Shared>) {
 pub struct Stats {
     pub fps: u32,
     pub mbps: f64,
-    /// 采集 → 提交解码 的平均耗时（毫秒）。
+    /// 画面更新 → 提交解码 的平均耗时（毫秒）。
     pub latency_ms: f64,
+    pub latency_max_ms: f64,
+    /// 其中被控端（采集等待 + 编码）的平均耗时。
+    pub host_ms: f64,
     pub rtt_ms: f64,
     pub lost: u32,
+    /// 靠 FEC 还原的帧数。
+    pub recovered: u32,
+}
+
+/// 把当前线程标记为“用户交互”级 QoS，避免被系统降频或推迟调度。
+fn set_latency_critical_qos() {
+    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+    extern "C" {
+        fn pthread_set_qos_class_self_np(qos: u32, relative_priority: i32) -> i32;
+    }
+    unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
 }
 
 /// 视频接收线程：UDP → 重组 → 解码显示。每秒回调一次统计信息。
@@ -126,6 +163,7 @@ pub fn spawn_video_receiver(
     mut on_stats: impl FnMut(Stats) + Send + 'static,
 ) {
     std::thread::spawn(move || {
+        set_latency_critical_qos();
         let mut reasm = video::Reassembler::new();
         let mut buf = [0u8; 2048];
         let mut last_key_request = Instant::now() - Duration::from_secs(1);
@@ -137,7 +175,8 @@ pub fn spawn_video_receiver(
             }
         };
 
-        let (mut frames, mut bytes, mut lost, mut latency_sum) = (0u32, 0usize, 0u32, 0i64);
+        let (mut frames, mut bytes, mut lost, mut recovered) = (0u32, 0usize, 0u32, 0u32);
+        let (mut latency_sum, mut latency_max, mut host_sum) = (0i64, 0i64, 0i64);
         let mut window_start = Instant::now();
 
         while shared.alive.load(Ordering::Relaxed) {
@@ -148,8 +187,12 @@ pub fn spawn_video_receiver(
                         video::Output::Frame(frame) => {
                             if sink.push(&frame.data) {
                                 frames += 1;
+                                recovered += frame.recovered as u32;
                                 let host_now = now_us() as i64 + shared.clock_offset_us.load(Ordering::Relaxed);
-                                latency_sum += host_now - frame.capture_us as i64;
+                                let latency = (host_now - frame.capture_us as i64).max(0);
+                                latency_sum += latency;
+                                latency_max = latency_max.max(latency);
+                                host_sum += frame.host_us as i64;
                             } else {
                                 request_key(false);
                             }
@@ -173,14 +216,19 @@ pub fn spawn_video_receiver(
 
             let elapsed = window_start.elapsed();
             if elapsed >= Duration::from_secs(1) {
+                let avg = |sum: i64| if frames > 0 { sum as f64 / frames as f64 / 1000.0 } else { 0.0 };
                 on_stats(Stats {
                     fps: (frames as f64 / elapsed.as_secs_f64()).round() as u32,
                     mbps: bytes as f64 * 8.0 / 1e6 / elapsed.as_secs_f64(),
-                    latency_ms: if frames > 0 { latency_sum as f64 / frames as f64 / 1000.0 } else { 0.0 },
+                    latency_ms: avg(latency_sum),
+                    latency_max_ms: latency_max as f64 / 1000.0,
+                    host_ms: avg(host_sum),
                     rtt_ms: shared.rtt_us.load(Ordering::Relaxed) as f64 / 1000.0,
                     lost,
+                    recovered,
                 });
-                (frames, bytes, lost, latency_sum) = (0, 0, 0, 0);
+                (frames, bytes, lost, recovered) = (0, 0, 0, 0);
+                (latency_sum, latency_max, host_sum) = (0, 0, 0);
                 window_start = Instant::now();
             }
         }

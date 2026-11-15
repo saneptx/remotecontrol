@@ -72,6 +72,8 @@ mod app {
 
     pub fn run() -> Result<()> {
         let args = Args::parse();
+        // 告诉系统这是延迟敏感的前台任务：不做 App Nap、不合并定时器。
+        let _activity = begin_latency_critical_activity();
         let conn = net::connect(&args.host, &args.password)?;
         println!("已连接，远端画面 {}x{} @ {}fps", conn.width, conn.height, conn.fps);
 
@@ -117,13 +119,32 @@ mod app {
             });
             net::spawn_pinger(control.clone(), self.shared.clone());
             let (title_window, host, print_stats) = (window.clone(), self.args.host.clone(), self.args.stats);
+            let shared = self.shared.clone();
             net::spawn_video_receiver(conn.udp, sink, control.clone(), self.shared.clone(), move |s| {
-                let lost = if s.lost > 0 { format!(" · 丢帧 {}", s.lost) } else { String::new() };
-                let line = format!("{} fps · {:.1} Mbps · 延迟 {:.1} ms · RTT {:.1} ms{lost}", s.fps, s.mbps, s.latency_ms, s.rtt_ms);
+                let mut line = format!(
+                    "{} fps · {:.0} Mbps · 延迟 {:.1} ms（被控端 {:.1} + 传输 {:.1}，最大 {:.1}）· RTT {:.1} ms",
+                    s.fps,
+                    s.mbps,
+                    s.latency_ms,
+                    s.host_ms,
+                    (s.latency_ms - s.host_ms).max(0.0),
+                    s.latency_max_ms,
+                    s.rtt_ms
+                );
+                if s.recovered > 0 {
+                    line += &format!(" · FEC 修复 {}", s.recovered);
+                }
+                if s.lost > 0 {
+                    line += &format!(" · 丢帧 {}", s.lost);
+                }
                 if print_stats {
                     println!("{line}");
                 }
-                title_window.set_title(&format!("远程控制 - {host} · {line}"));
+                let title = match shared.notice.lock().unwrap().as_deref() {
+                    Some(n) => format!("远程控制 - {host} · ⚠️ {n}"),
+                    None => format!("远程控制 - {host} · {line}"),
+                };
+                title_window.set_title(&title);
             });
 
             self.window = Some(window);
@@ -150,6 +171,19 @@ mod app {
             for button in std::mem::take(&mut self.buttons_down) {
                 self.send(InputEvent::MouseButton { button, down: false });
             }
+        }
+    }
+
+    fn begin_latency_critical_activity() -> Option<objc2::rc::Retained<objc2::runtime::AnyObject>> {
+        use objc2::runtime::{AnyClass, AnyObject};
+        use objc2::msg_send;
+        use objc2_foundation::NSString;
+        const NS_ACTIVITY_USER_INITIATED: u64 = 0x00FF_FFFF;
+        const NS_ACTIVITY_LATENCY_CRITICAL: u64 = 0xFF_0000_0000;
+        unsafe {
+            let info: *mut AnyObject = msg_send![AnyClass::get(c"NSProcessInfo")?, processInfo];
+            let reason = NSString::from_str("远程控制画面传输");
+            msg_send![info, beginActivityWithOptions: NS_ACTIVITY_USER_INITIATED | NS_ACTIVITY_LATENCY_CRITICAL, reason: &*reason]
         }
     }
 

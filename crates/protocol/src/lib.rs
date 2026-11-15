@@ -12,7 +12,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::Sha256;
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_PORT: u16 = 47800;
 const MAX_MSG_LEN: u32 = 64 * 1024;
 
@@ -33,6 +33,8 @@ pub enum HostMsg {
     Reject { reason: String },
     /// `t_us` 原样返回，`host_us` 为被控端时钟，用于估算两端时钟差。
     Pong { t_us: u64, host_us: u64 },
+    /// 被控端状态提示（例如处于锁屏、无法采集）；`None` 表示恢复正常。
+    Notice { text: Option<String> },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]

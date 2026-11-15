@@ -66,6 +66,15 @@ impl Injector {
     }
 }
 
+/// 相对移动 1 像素再移回，用于唤醒显示器。
+pub fn nudge_mouse() {
+    let mv = |dx: i32| INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy: 0, mouseData: 0, dwFlags: MOUSEEVENTF_MOVE, time: 0, dwExtraInfo: 0 } },
+    };
+    unsafe { SendInput(&[mv(1), mv(-1)], size_of::<INPUT>() as i32) };
+}
+
 /// 把屏幕内归一化坐标 (0..=65535) 换算成 SendInput 要求的“虚拟桌面归一化坐标”。
 fn to_virtual(norm: u16, origin: i32, size: u32, v_origin: i32, v_size: i32) -> i32 {
     let px = origin as i64 + norm as i64 * (size.max(1) as i64 - 1) / 65535;

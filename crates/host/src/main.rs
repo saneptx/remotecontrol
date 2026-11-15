@@ -29,9 +29,18 @@ pub struct Args {
     /// 目标码率（Mbps）。4:4:4 下 1080p 建议 50+，4K 建议 100+
     #[arg(long, default_value_t = 80)]
     pub bitrate: u32,
-    /// 最高帧率
-    #[arg(long, default_value_t = 60)]
-    pub fps: u32,
+    /// 最高帧率；默认跟随显示器刷新率
+    #[arg(long)]
+    pub fps: Option<u32>,
+    /// 前向纠错冗余比例（%）。Wi-Fi 下建议 20 以上，有线网络可降到 5～10，0 为关闭
+    #[arg(long, default_value_t = 20)]
+    fec: u32,
+    /// 允许系统按电源设置进入睡眠（默认被控端运行期间阻止睡眠，否则睡眠后无法连接）
+    #[arg(long)]
+    allow_sleep: bool,
+    /// 测试用：随机丢弃该比例（%）的视频包，模拟网络丢包
+    #[arg(long, hide = true, default_value_t = 0.0)]
+    sim_loss: f64,
 }
 
 /// 进程启动以来的微秒数；采集时间戳与 Pong 共用这一时钟。
@@ -42,10 +51,15 @@ pub fn now_us() -> u64 {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    if args.fps == 0 || args.bitrate == 0 {
+    if args.fps == Some(0) || args.bitrate == 0 {
         bail!("--fps 和 --bitrate 必须大于 0");
     }
+    if args.fec > 200 {
+        bail!("--fec 不能超过 200");
+    }
     now_us();
+    #[cfg(windows)]
+    win::power::init(!args.allow_sleep);
     let password = args.password.clone().unwrap_or_else(|| {
         // 去掉易混淆字符的 8 位随机口令
         const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
@@ -107,7 +121,10 @@ fn session(mut tcp: TcpStream, args: &Args, password: &str) -> Result<()> {
         }
     };
     let (width, height) = video_src.size();
-    proto::write_msg(&mut tcp, &HostMsg::Welcome { width, height, fps: args.fps })?;
+    proto::write_msg(&mut tcp, &HostMsg::Welcome { width, height, fps: video_src.fps() })?;
+    // 会话期间保持显示器常亮
+    #[cfg(windows)]
+    let _awake = win::power::SessionAwake::new();
     tcp.set_read_timeout(None)?;
 
     let udp = UdpSocket::bind("0.0.0.0:0")?;
@@ -142,10 +159,35 @@ fn session(mut tcp: TcpStream, args: &Args, password: &str) -> Result<()> {
     // ---- 视频主循环 ----
     let result = (|| -> Result<()> {
         let mut frame_id = 0u32;
+        let mut notice: Option<String> = None;
+        let mut loss = SimLoss::new(args.sim_loss);
         while alive.load(Ordering::Relaxed) {
             let force_key = want_key.swap(false, Ordering::Relaxed);
-            let Some(frame) = video_src.next_frame(force_key)? else { continue };
-            video::packetize(frame_id, frame.keyframe, frame.capture_us, &frame.data, |pkt| send_datagram(&udp, pkt))?;
+            let frame = video_src.next_frame(force_key)?;
+
+            let current = video_src.notice();
+            if current != notice {
+                match &current {
+                    Some(t) => println!("提示: {t}"),
+                    None => println!("画面已恢复"),
+                }
+                proto::write_msg(&mut *writer.lock().unwrap(), &HostMsg::Notice { text: current.clone() })?;
+                notice = current;
+            }
+
+            let Some(frame) = frame else { continue };
+            let meta = video::FrameMeta {
+                frame_id,
+                keyframe: frame.keyframe,
+                capture_us: frame.capture_us,
+                host_us: now_us().saturating_sub(frame.capture_us).min(u32::MAX as u64) as u32,
+            };
+            video::packetize(&meta, &frame.data, args.fec, |pkt| {
+                if loss.drop() {
+                    return Ok(());
+                }
+                send_datagram(&udp, pkt)
+            })?;
             frame_id = frame_id.wrapping_add(1);
         }
         Ok(())
@@ -169,6 +211,29 @@ fn send_datagram(udp: &UdpSocket, pkt: &[u8]) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// 测试用的随机丢包（xorshift）。
+struct SimLoss {
+    threshold: u64,
+    state: u64,
+}
+
+impl SimLoss {
+    fn new(pct: f64) -> Self {
+        let seed = u64::from_le_bytes(proto::random_nonce()[..8].try_into().unwrap()) | 1;
+        Self { threshold: ((pct.clamp(0.0, 100.0) / 100.0) * u64::MAX as f64) as u64, state: seed }
+    }
+
+    fn drop(&mut self) -> bool {
+        if self.threshold == 0 {
+            return false;
+        }
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        self.state < self.threshold
+    }
 }
 
 #[cfg(windows)]
