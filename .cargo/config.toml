@@ -1,0 +1,3 @@
+# Windows 上静态链接 C 运行库：生成的 exe 不依赖 VC++ 运行库，拷到任何机器都能直接运行。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

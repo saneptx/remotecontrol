@@ -17,6 +17,16 @@
 - `crates/host` — 被控端（Windows；其它平台只有用于联调的测试图像源）
 - `crates/client` — 控制端（macOS）
 
+## 下载
+
+不想自己编译的话，GitHub Actions 每次推送都会自动构建：
+
+- 最新构建：仓库的 **Actions** 页 → 最近一次成功的 `build` → 页面底部 Artifacts 里的 `rc-host-windows-x64`
+- 正式版本：推送 `v*` 标签（如 `git tag v0.1.0 && git push origin v0.1.0`）后会自动发布到 **Releases**
+
+`rc-host.exe` 是单个文件，不需要安装任何运行库，双击即可运行（需要 NVIDIA 显卡与较新驱动）。
+首次运行时 Windows 防火墙会弹窗，选择允许“专用网络”。
+
 ## 构建与运行
 
 被控端（Windows，需要 NVIDIA GTX 10 系及以上显卡、较新驱动、Rust MSVC 工具链）：
@@ -27,7 +37,6 @@ target\release\rc-host.exe --bitrate 80 --fps 60
 ```
 
 启动后会打印连接密码（也可用 `--password` 或环境变量 `RC_PASSWORD` 固定）。
-首次运行需在 Windows 防火墙放行 TCP 47800 入站。
 
 控制端（macOS）：
 
