@@ -134,20 +134,27 @@ fn run_host(args: Args) -> Result<()> {
         };
         let peer = stream.peer_addr().ok();
         match session(stream, &args, &password) {
-            Ok(()) => println!("会话结束 {peer:?}"),
+            Ok(true) => println!("会话结束 {peer:?}"),
+            Ok(false) => {} // 端口探测
             Err(e) => eprintln!("会话出错 {peer:?}: {e:#}"),
         }
     }
     Ok(())
 }
 
-fn session(mut tcp: TcpStream, args: &Args, password: &str) -> Result<()> {
+/// 返回 `Ok(false)` 表示对方只是连上就断开（端口探测，例如 `rc-host status`），不记日志。
+fn session(mut tcp: TcpStream, args: &Args, password: &str) -> Result<bool> {
     tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
     let peer = tcp.peer_addr()?;
 
     // ---- 握手 ----
-    let ClientMsg::Hello { version, client_nonce } = proto::read_msg(&mut tcp)? else {
+    let hello = match proto::read_msg::<ClientMsg>(&mut tcp) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let ClientMsg::Hello { version, client_nonce } = hello else {
         bail!("握手失败：期望 Hello");
     };
     if version != proto::PROTOCOL_VERSION {
@@ -250,7 +257,7 @@ fn session(mut tcp: TcpStream, args: &Args, password: &str) -> Result<()> {
     // 关闭 TCP 让读线程退出
     let _ = writer.lock().unwrap().shutdown(std::net::Shutdown::Both);
     let _ = reader.join();
-    result
+    result.map(|()| true)
 }
 
 /// 发送一个 UDP 包。发送缓冲区满时短暂退避重试；其余错误（例如对端端口暂不可达）忽略，

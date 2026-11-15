@@ -375,6 +375,23 @@ fn network_profiles() -> Vec<(String, String)> {
         .collect()
 }
 
+/// 带有局域网地址（10/8、172.16/12、192.168/16）的网卡。代理软件的 TUN 网卡（如 198.18.x）、
+/// Tailscale（100.x）等不在其中——它们是不是“公用网络”与局域网连接无关。
+fn lan_interfaces() -> std::collections::HashSet<String> {
+    powershell("Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object { \"$($_.InterfaceAlias)`t$($_.IPAddress)\" }")
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .filter(|(_, ip)| ip.trim().parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_private()))
+        .map(|(nic, _)| nic.trim().to_string())
+        .collect()
+}
+
+/// 被识别为公用网络的局域网网卡。
+fn public_lan_interfaces() -> Vec<String> {
+    let lan = lan_interfaces();
+    network_profiles().into_iter().filter(|(nic, cat)| cat == "Public" && lan.contains(nic)).map(|(nic, _)| nic).collect()
+}
+
 const PUBLIC_NETWORK_HINT: &str = "防火墙规则只对“专用网络”生效，公用网络下控制端连不上。\n\
      修改方法：设置 → 网络和 Internet → 以太网 / WLAN → 当前网络的“属性” → 网络配置文件类型选“专用网络”。";
 
@@ -460,7 +477,7 @@ pub fn install(args: &Args) -> Result<()> {
     ]) {
         eprintln!("警告：添加防火墙规则失败，可能需要手动放行 TCP {} 入站", args.port);
     }
-    let public: Vec<String> = network_profiles().into_iter().filter(|(_, c)| c == "Public").map(|(n, _)| n).collect();
+    let public = public_lan_interfaces();
 
     // 4. 创建（或更新）服务：开机自动启动，以 LocalSystem 运行，崩溃后自动重启。
     let mut launch_arguments: Vec<OsString> = vec!["service".into()];
@@ -580,15 +597,18 @@ pub fn status() -> Result<()> {
             println!("本机地址：{ip}（{nic}）");
         }
     }
+    let lan = lan_interfaces();
     for (nic, cat) in network_profiles() {
+        let is_lan = lan.contains(&nic);
         let name = match cat.as_str() {
-            "Public" => "公用网络 ⚠️",
+            "Public" if is_lan => "公用网络 ⚠️",
+            "Public" => "公用网络（不是局域网网卡，不影响）",
             "Private" => "专用网络",
             "DomainAuthenticated" => "域网络",
             other => other,
         };
         println!("网络类型：{nic} → {name}");
-        if cat == "Public" {
+        if cat == "Public" && is_lan {
             problems.push(format!("网络「{nic}」是公用网络。{PUBLIC_NETWORK_HINT}"));
         }
     }
