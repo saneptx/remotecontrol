@@ -12,7 +12,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::Sha256;
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const DEFAULT_PORT: u16 = 47800;
 const MAX_MSG_LEN: u32 = 64 * 1024;
 
@@ -24,6 +24,9 @@ pub enum ClientMsg {
     Input(InputEvent),
     RequestKeyframe,
     Ping { t_us: u64 },
+    /// 控制端窗口的实际像素尺寸。被控端按它缩小编码分辨率（不放大），
+    /// 避免编码最终看不到的像素。`0x0` 表示要求原始分辨率。
+    Viewport { width: u32, height: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

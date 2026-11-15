@@ -5,27 +5,86 @@ mod desktop;
 pub mod input;
 mod nvenc;
 pub mod power;
+mod scale;
 pub mod service;
 
-use crate::source::{EncodedFrame, VideoSource};
+use crate::source::{encode_size, EncodedFrame, VideoSource};
 use crate::{now_us, Args};
 use anyhow::{bail, Result};
 use capture::{Capturer, State};
 use std::time::{Duration, Instant};
+use windows::Win32::Graphics::Direct3D11::{ID3D11Query, D3D11_QUERY_DESC, D3D11_QUERY_EVENT};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
-/// 采集 + 编码管线。字段按声明顺序析构：编码器必须先于它引用的纹理/设备释放。
+/// 采集 →（缩放）→ 编码管线。字段按声明顺序析构：编码器必须先于它引用的纹理/设备释放。
 struct Pipeline {
     enc: nvenc::Encoder,
+    scaler: Option<scale::Scaler>,
+    /// GPU 栅栏：等拷贝/缩放真正执行完，用于分段计时。
+    fence: ID3D11Query,
     cap: Capturer,
 }
 
 impl Pipeline {
-    fn open(fps: Option<u32>, bitrate: u32) -> Result<(Self, u32)> {
+    fn open(fps: Option<u32>, bitrate: u32, viewport: (u32, u32)) -> Result<(Self, u32)> {
         let cap = Capturer::new()?;
         let fps = fps.unwrap_or(cap.refresh_hz).clamp(1, 240);
-        let enc = nvenc::Encoder::new(cap.device(), cap.target(), cap.width, cap.height, fps, bitrate)?;
-        Ok((Self { enc, cap }, fps))
+        let (scaler, enc) = Self::make_encoder(&cap, fps, bitrate, viewport)?;
+        let mut fence = None;
+        unsafe { cap.device().CreateQuery(&D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 }, Some(&mut fence))? };
+        Ok((Self { enc, scaler, fence: fence.unwrap(), cap }, fps))
+    }
+
+    /// 按控制端窗口尺寸创建编码器；需要缩小时在前面接一个显卡缩放器。
+    fn make_encoder(cap: &Capturer, fps: u32, bitrate: u32, viewport: (u32, u32)) -> Result<(Option<scale::Scaler>, nvenc::Encoder)> {
+        let src = (cap.width, cap.height);
+        let (w, h) = encode_size(src, viewport);
+        if (w, h) != src {
+            match scale::Scaler::new(cap.device(), cap.context(), cap.target(), src, (w, h), fps) {
+                Ok(scaler) => {
+                    let enc = nvenc::Encoder::new(cap.device(), scaler.output(), w, h, fps, bitrate)?;
+                    println!("编码分辨率 {w}x{h}（采集 {}x{}，按控制端窗口缩小）", src.0, src.1);
+                    return Ok((Some(scaler), enc));
+                }
+                Err(e) => eprintln!("创建缩放器失败，改用原始分辨率: {e:#}"),
+            }
+        }
+        println!("编码分辨率 {}x{}（原始）", src.0, src.1);
+        Ok((None, nvenc::Encoder::new(cap.device(), cap.target(), src.0, src.1, fps, bitrate)?))
+    }
+
+    fn resize(&mut self, fps: u32, bitrate: u32, viewport: (u32, u32)) -> Result<()> {
+        let (scaler, enc) = Self::make_encoder(&self.cap, fps, bitrate, viewport)?;
+        self.enc = enc; // 旧编码器在这里析构，随后才替换它引用的旧缩放纹理
+        self.scaler = scaler;
+        Ok(())
+    }
+
+    fn encode(&mut self, force_idr: bool, prof: &mut Profile) -> Result<(Vec<u8>, bool)> {
+        let t0 = Instant::now();
+        if let Some(s) = &self.scaler {
+            s.process()?;
+        }
+        // 等前面排队的 GPU 工作（采集拷贝 + 缩放）执行完。反正编码也要等它们，这里只是把时间分开统计。
+        unsafe {
+            let ctx = self.cap.context();
+            ctx.End(&self.fence);
+            ctx.Flush();
+            let deadline = Instant::now() + Duration::from_millis(100);
+            loop {
+                let mut done = windows::core::BOOL(0);
+                let ok = ctx.GetData(&self.fence, Some((&mut done as *mut windows::core::BOOL).cast()), 4, 0).is_ok();
+                if (ok && done.as_bool()) || Instant::now() > deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+        let t1 = Instant::now();
+        let out = self.enc.encode(force_idr)?;
+        prof.scale += t1 - t0;
+        prof.encode += t1.elapsed();
+        Ok(out)
     }
 }
 
@@ -46,6 +105,43 @@ pub struct WinSource {
     pending_key: bool,
     notice: Option<String>,
     last_rebuild: Instant,
+    /// 控制端窗口像素尺寸；(0, 0) 表示原始分辨率。
+    viewport: (u32, u32),
+    prof: Profile,
+}
+
+/// 被控端分段耗时，每 5 秒写一行日志，用于定位延迟。
+struct Profile {
+    since: Instant,
+    frames: u32,
+    /// 画面更新 → 开始编码
+    wait: Duration,
+    scale: Duration,
+    encode: Duration,
+}
+
+impl Profile {
+    fn new() -> Self {
+        Self { since: Instant::now(), frames: 0, wait: Duration::ZERO, scale: Duration::ZERO, encode: Duration::ZERO }
+    }
+
+    fn maybe_log(&mut self) {
+        let elapsed = self.since.elapsed();
+        if elapsed < Duration::from_secs(5) {
+            return;
+        }
+        if self.frames > 0 {
+            let avg = |d: Duration| d.as_secs_f64() * 1000.0 / self.frames as f64;
+            println!(
+                "性能: {:.0} fps，等待 {:.1} ms，GPU 拷贝+缩放 {:.1} ms，编码 {:.1} ms",
+                self.frames as f64 / elapsed.as_secs_f64(),
+                avg(self.wait),
+                avg(self.scale),
+                avg(self.encode)
+            );
+        }
+        *self = Self::new();
+    }
 }
 
 impl WinSource {
@@ -54,7 +150,7 @@ impl WinSource {
         power::wake_display();
         let deadline = Instant::now() + Duration::from_secs(5);
         let (pipe, fps) = loop {
-            match Pipeline::open(args.fps, args.bitrate) {
+            match Pipeline::open(args.fps, args.bitrate, (0, 0)) {
                 Ok(v) => break v,
                 Err(e) if Instant::now() < deadline => {
                     eprintln!("初始化采集失败，重试中: {e:#}");
@@ -82,6 +178,8 @@ impl WinSource {
             pending_key: true,
             notice: None,
             last_rebuild: Instant::now(),
+            viewport: (0, 0),
+            prof: Profile::new(),
         })
     }
 
@@ -98,7 +196,7 @@ impl WinSource {
         }
         self.last_rebuild = Instant::now();
         power::wake_display();
-        match Pipeline::open(self.fps_arg, self.bitrate) {
+        match Pipeline::open(self.fps_arg, self.bitrate, self.viewport) {
             Ok((p, _)) => {
                 if (p.cap.width, p.cap.height) != (self.width, self.height) {
                     bail!("屏幕分辨率已变化（{}x{} → {}x{}），请重新连接", self.width, self.height, p.cap.width, p.cap.height);
@@ -111,7 +209,7 @@ impl WinSource {
             }
             Err(e) => {
                 let msg = format!("{e:#}");
-                self.notice = Some(if msg.contains("安全桌面") { msg } else { "远端显示器不可用（可能已关闭），正在重试…".into() });
+                self.notice = Some(if msg.contains("锁屏") { msg } else { "远端显示器不可用（可能已关闭），正在重试…".into() });
             }
         }
         Ok(())
@@ -140,6 +238,21 @@ impl VideoSource for WinSource {
 
     fn notice(&self) -> Option<String> {
         self.notice.clone()
+    }
+
+    fn set_viewport(&mut self, width: u32, height: u32) -> Result<()> {
+        if self.viewport == (width, height) {
+            return Ok(());
+        }
+        self.viewport = (width, height);
+        let Some(p) = self.inner.as_mut() else { return Ok(()) };
+        if let Err(e) = p.resize(self.fps, self.bitrate, self.viewport) {
+            // 新编码器建不起来时整条管线重建（try_rebuild 会按新尺寸来）。
+            eprintln!("调整编码分辨率失败: {e:#}");
+            self.inner = None;
+        }
+        self.pending_key = true;
+        Ok(())
     }
 
     fn next_frame(&mut self, force_key: bool) -> Result<Option<EncodedFrame>> {
@@ -181,7 +294,10 @@ impl VideoSource for WinSource {
 
         let capture_us = self.dirty_since.take().map(qpc_to_us).unwrap_or_else(now_us);
         self.last_encode = Instant::now();
-        let (data, keyframe) = p.enc.encode(self.pending_key)?;
+        self.prof.frames += 1;
+        self.prof.wait += Duration::from_micros(now_us().saturating_sub(capture_us));
+        let (data, keyframe) = p.encode(self.pending_key, &mut self.prof)?;
+        self.prof.maybe_log();
         self.pending_key = false;
         Ok(Some(EncodedFrame { data, keyframe, capture_us }))
     }

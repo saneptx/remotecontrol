@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
 use rc_protocol::{self as proto, video, ClientMsg, HostMsg};
 use source::{InputSink, VideoSource};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -194,14 +194,20 @@ fn session(mut tcp: TcpStream, args: &Args, password: &str) -> Result<bool> {
 
     // ---- 控制通道读线程：输入事件、关键帧请求、心跳 ----
     let alive = Arc::new(AtomicBool::new(true));
+    // 控制端窗口尺寸，打包成 (w << 32 | h)；NO_VIEWPORT 表示还没收到。
+    const NO_VIEWPORT: u64 = u64::MAX;
+    let viewport = Arc::new(AtomicU64::new(NO_VIEWPORT));
     let want_key = Arc::new(AtomicBool::new(true));
     let writer = Arc::new(Mutex::new(tcp.try_clone()?));
     let reader = {
-        let (alive, want_key, writer) = (alive.clone(), want_key.clone(), writer.clone());
+        let (alive, want_key, writer, viewport) = (alive.clone(), want_key.clone(), writer.clone(), viewport.clone());
         std::thread::spawn(move || {
             loop {
                 match proto::read_msg::<ClientMsg>(&mut tcp) {
                     Ok(ClientMsg::Input(ev)) => input.inject(ev),
+                    Ok(ClientMsg::Viewport { width, height }) => {
+                        viewport.store(((width as u64) << 32) | height as u64, Ordering::Relaxed)
+                    }
                     Ok(ClientMsg::RequestKeyframe) => want_key.store(true, Ordering::Relaxed),
                     Ok(ClientMsg::Ping { t_us }) => {
                         let pong = HostMsg::Pong { t_us, host_us: now_us() };
@@ -222,7 +228,21 @@ fn session(mut tcp: TcpStream, args: &Args, password: &str) -> Result<bool> {
         let mut frame_id = 0u32;
         let mut notice: Option<String> = None;
         let mut loss = SimLoss::new(args.sim_loss);
+        // 窗口拖动缩放时会连续收到很多尺寸：稳定 300ms 后才重建编码器。第一次立即生效。
+        let (mut applied_vp, mut pending_vp) = (NO_VIEWPORT, NO_VIEWPORT);
+        let mut pending_since = Instant::now();
         while alive.load(Ordering::Relaxed) {
+            let vp = viewport.load(Ordering::Relaxed);
+            if vp != pending_vp {
+                pending_vp = vp;
+                pending_since = Instant::now();
+            }
+            let settled = applied_vp == NO_VIEWPORT || pending_since.elapsed() >= Duration::from_millis(300);
+            if pending_vp != applied_vp && pending_vp != NO_VIEWPORT && settled {
+                video_src.set_viewport((pending_vp >> 32) as u32, pending_vp as u32)?;
+                applied_vp = pending_vp;
+            }
+
             let force_key = want_key.swap(false, Ordering::Relaxed);
             let frame = video_src.next_frame(force_key)?;
 

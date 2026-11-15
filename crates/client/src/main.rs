@@ -50,6 +50,9 @@ mod app {
         /// 每秒在终端打印一行统计信息
         #[arg(long)]
         stats: bool,
+        /// 始终按远端原始分辨率传输（默认按本机窗口的实际像素尺寸缩小编码，延迟更低）
+        #[arg(long)]
+        native: bool,
     }
 
     enum UserEvent {
@@ -137,6 +140,9 @@ mod app {
                 if s.lost > 0 {
                     line += &format!(" · 丢帧 {}", s.lost);
                 }
+                if s.awdl_active {
+                    line += " · ⚠️ AWDL 开启（会造成延迟尖峰）";
+                }
                 if print_stats {
                     println!("{line}");
                 }
@@ -149,7 +155,20 @@ mod app {
 
             self.window = Some(window);
             self.control = Some(control);
+            self.send_viewport();
             Ok(())
+        }
+
+        /// 告诉被控端本机窗口的实际像素尺寸，它会按此缩小编码分辨率。
+        fn send_viewport(&self) {
+            let (Some(window), Some(control)) = (&self.window, &self.control) else { return };
+            let (width, height) = if self.args.native {
+                (0, 0)
+            } else {
+                let size = window.inner_size();
+                (size.width, size.height)
+            };
+            control.send(&ClientMsg::Viewport { width, height });
         }
 
         fn send(&self, ev: InputEvent) {
@@ -225,6 +244,8 @@ mod app {
                     event_loop.exit();
                 }
                 WindowEvent::Focused(false) => self.release_all(),
+                // 包括切换全屏、拖到不同缩放比例的显示器（被控端会去抖）
+                WindowEvent::Resized(_) => self.send_viewport(),
                 WindowEvent::CursorMoved { position, .. } => {
                     let (x, y) = self.map_cursor(position, window.inner_size());
                     self.send(InputEvent::MouseMoveAbs { x, y });

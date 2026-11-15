@@ -5,7 +5,7 @@
 | | 实现 |
 |---|---|
 | 采集 | DXGI Desktop Duplication（画面无变化时不发送任何数据） |
-| 编码 | NVENC HEVC **4:4:4**，P1 预设 + 超低延迟调优，无 B 帧，CBR + 单帧 VBV，显存内零拷贝 |
+| 编码 | NVENC HEVC **4:4:4**，P1 预设 + 超低延迟调优，无 B 帧，CBR + 单帧 VBV，显存内零拷贝；按控制端窗口的实际像素尺寸在显卡上缩小后再编码 |
 | 传输 | 视频走 UDP（≤1400 字节分片 + Reed-Solomon 前向纠错，零星丢包直接还原，不重传）；控制走 TCP_NODELAY |
 | 解码显示 | VideoToolbox 硬解 + AVSampleBufferDisplayLayer，解完立即上屏，不缓冲 |
 | 输入 | 绝对坐标鼠标、滚轮、扫描码键盘，经 SendInput 注入 |
@@ -81,6 +81,9 @@ target/release/rc-client 192.168.1.20 -p <密码>
 
 - `--cmd-as-ctrl`：把 Command 当作 Ctrl 发送（默认当作 Win 键）
 - `--stats`：每秒在终端打印帧率 / 码率 / 延迟
+- `--native`：始终按远端原始分辨率传输。默认情况下，被控端会按本机窗口的实际像素尺寸缩小后再编码
+  （例如 4K 屏幕在 2560 像素宽的窗口里按 2560×1440 编码）：最终显示效果相同，编码耗时和带宽都更低。
+  调整窗口大小或切换全屏后会自动跟随。
 
 被控端常用参数：
 
@@ -100,8 +103,10 @@ target/release/rc-client 192.168.1.20 -p <密码>
 ### 网络建议（对延迟影响最大）
 
 - **两端尽量都走有线**。Wi-Fi 是延迟抖动和丢包的主要来源；Mac 可用 USB-C 转网口。
-- Mac 用 Wi-Fi 时，AirDrop / 接力使用的 AWDL 会周期性切换信道，造成几十毫秒的停顿。
-  测试时可临时关闭：`sudo ifconfig awdl0 down`（重启或 `sudo ifconfig awdl0 up` 恢复，期间 AirDrop 不可用）。
+- **2.4 GHz Wi-Fi 带宽不够**，Mac 和 Windows 都要连 5 GHz（或 6 GHz）网络。
+- Mac 用 Wi-Fi 时，AirDrop / 接力 / 通用控制使用的 AWDL 会周期性切换信道，造成几十到上百毫秒的停顿
+  （窗口标题会提示“AWDL 开启”）。macOS 会自动把它重新打开，推荐安装守护脚本，只在远程控制期间压住它：
+  `sudo packaging/macos/awdl-guard.sh install`（卸载：`sudo packaging/macos/awdl-guard.sh uninstall`）。
 - 不开串流时先 `ping` 一下被控端：如果 RTT 本身就忽高忽低，问题在网络，不在本程序。
 
 没有 Windows 机器时，可在 macOS 上直接运行 `rc-host`（需要带 libx265 的 ffmpeg），

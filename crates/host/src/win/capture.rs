@@ -99,7 +99,8 @@ impl Capturer {
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
                 SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                 Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                // SHADER_RESOURCE：作为视频处理器（缩放）的输入
+                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
                 CPUAccessFlags: 0,
                 MiscFlags: 0,
             };
@@ -125,6 +126,10 @@ impl Capturer {
 
     pub fn device(&self) -> &ID3D11Device {
         &self.device
+    }
+
+    pub fn context(&self) -> &ID3D11DeviceContext {
+        &self.context
     }
 
     pub fn target(&self) -> &ID3D11Texture2D {

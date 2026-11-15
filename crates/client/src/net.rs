@@ -143,6 +143,17 @@ pub struct Stats {
     pub lost: u32,
     /// 靠 FEC 还原的帧数。
     pub recovered: u32,
+    /// AWDL（AirDrop 等使用的无线通道）处于开启状态。
+    pub awdl_active: bool,
+}
+
+/// 检查 awdl0 是否开启。它会让 Wi-Fi 周期性切换信道，造成几十到上百毫秒的停顿。
+fn awdl_active() -> bool {
+    std::process::Command::new("/sbin/ifconfig")
+        .arg("awdl0")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().next().is_some_and(|l| l.contains("<UP")))
+        .unwrap_or(false)
 }
 
 /// 把当前线程标记为“用户交互”级 QoS，避免被系统降频或推迟调度。
@@ -178,6 +189,9 @@ pub fn spawn_video_receiver(
         let (mut frames, mut bytes, mut lost, mut recovered) = (0u32, 0usize, 0u32, 0u32);
         let (mut latency_sum, mut latency_max, mut host_sum) = (0i64, 0i64, 0i64);
         let mut window_start = Instant::now();
+        let mut awdl = awdl_active();
+        let mut awdl_warned = false;
+        let mut stats_ticks = 0u32;
 
         while shared.alive.load(Ordering::Relaxed) {
             match udp.recv(&mut buf) {
@@ -216,6 +230,14 @@ pub fn spawn_video_receiver(
 
             let elapsed = window_start.elapsed();
             if elapsed >= Duration::from_secs(1) {
+                stats_ticks += 1;
+                if stats_ticks % 3 == 0 {
+                    awdl = awdl_active();
+                }
+                if awdl && !awdl_warned {
+                    awdl_warned = true;
+                    eprintln!("提示：AWDL 处于开启状态，Wi-Fi 下会造成周期性延迟尖峰。可运行 packaging/macos/awdl-guard.sh 安装自动处理。");
+                }
                 let avg = |sum: i64| if frames > 0 { sum as f64 / frames as f64 / 1000.0 } else { 0.0 };
                 on_stats(Stats {
                     fps: (frames as f64 / elapsed.as_secs_f64()).round() as u32,
@@ -226,6 +248,7 @@ pub fn spawn_video_receiver(
                     rtt_ms: shared.rtt_us.load(Ordering::Relaxed) as f64 / 1000.0,
                     lost,
                     recovered,
+                    awdl_active: awdl,
                 });
                 (frames, bytes, lost, recovered) = (0, 0, 0, 0);
                 (latency_sum, latency_max, host_sum) = (0, 0, 0);
