@@ -55,7 +55,7 @@ fn run(dest: SocketAddr, alive: &AtomicBool) -> anyhow::Result<()> {
         [l, if channels > 1 { audio::f32_to_i16(frame[1]) } else { l }]
     };
     let config = cpal::StreamConfig { channels: channels as u16, sample_rate: rate, buffer_size: cpal::BufferSize::Default };
-    let err = |e: cpal::StreamError| {
+    let err = |e: cpal::Error| {
         if !e.to_string().contains("underrun") {
             eprintln!("声音采集出错: {e}")
         }
