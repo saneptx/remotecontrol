@@ -25,6 +25,8 @@ pub struct Connection {
     pub addr: SocketAddr,
     /// 打开数据通道（剪贴板、文件）用的凭据
     pub data_token: [u8; 16],
+    /// 接收声音的 UDP 端口（不要声音时为 None）
+    pub audio: Option<UdpSocket>,
 }
 
 /// 握手过程中需要告知用户的事件。
@@ -40,15 +42,15 @@ pub fn parse_addr(host: &str) -> Result<SocketAddr> {
 
 /// 只做配对（已配对则直接返回）：拿到配对密钥并确认对方接受后立即断开，不打开远程画面。
 pub fn pair(addr: SocketAddr, on_event: impl FnMut(HandshakeEvent)) -> Result<()> {
-    handshake(addr, on_event, true).map(|_| ())
+    handshake(addr, on_event, true, false).map(|_| ())
 }
 
 /// 连接并完成握手。未配对时会发起配对：`on_event` 收到配对码，用户需要在被控端点“允许”。
-pub fn connect(addr: SocketAddr, on_event: impl FnMut(HandshakeEvent)) -> Result<Connection> {
-    handshake(addr, on_event, false)?.context("握手未完成")
+pub fn connect(addr: SocketAddr, want_audio: bool, on_event: impl FnMut(HandshakeEvent)) -> Result<Connection> {
+    handshake(addr, on_event, false, want_audio)?.context("握手未完成")
 }
 
-fn handshake(addr: SocketAddr, mut on_event: impl FnMut(HandshakeEvent), pair_only: bool) -> Result<Option<Connection>> {
+fn handshake(addr: SocketAddr, mut on_event: impl FnMut(HandshakeEvent), pair_only: bool, want_audio: bool) -> Result<Option<Connection>> {
     let device_id = config::device_id()?;
     let mut tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).with_context(|| format!("连接 {addr} 失败"))?;
     tcp.set_nodelay(true)?;
@@ -110,7 +112,9 @@ fn handshake(addr: SocketAddr, mut on_event: impl FnMut(HandshakeEvent), pair_on
     };
 
     let mac = proto::pair::client_mac(&key, &host_nonce, &client_nonce);
-    proto::write_msg(&mut tcp, &ClientMsg::Auth { mac, udp_port: udp.local_addr()?.port() })?;
+    let audio = if want_audio { UdpSocket::bind("0.0.0.0:0").ok() } else { None };
+    let audio_port = audio.as_ref().and_then(|a| a.local_addr().ok()).map(|a| a.port()).unwrap_or(0);
+    proto::write_msg(&mut tcp, &ClientMsg::Auth { mac, udp_port: udp.local_addr()?.port(), audio_port })?;
     match proto::read_msg(&mut tcp)? {
         HostMsg::Welcome { width, height, fps, host_proof, data_token } => {
             if !proto::pair::ct_eq(&host_proof, &proto::pair::host_proof(&key, &host_nonce, &client_nonce)) {
@@ -122,7 +126,7 @@ fn handshake(addr: SocketAddr, mut on_event: impl FnMut(HandshakeEvent), pair_on
                 eprintln!("已与「{host_name}」配对，以后可直接连接");
             }
             tcp.set_read_timeout(None)?;
-            Ok(Some(Connection { tcp, udp, width, height, fps, host_name, addr, data_token }))
+            Ok(Some(Connection { tcp, udp, width, height, fps, host_name, addr, data_token, audio }))
         }
         HostMsg::Reject { reason } => bail!("被控端拒绝连接: {reason}"),
         other => bail!("握手失败: {other:?}"),

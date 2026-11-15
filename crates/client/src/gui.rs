@@ -237,6 +237,7 @@ impl Gui {
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
         changed |= ui.checkbox(&mut self.settings.cmd_as_ctrl, "Command 键当作 Ctrl（⌘C / ⌘V 即复制粘贴）").changed();
+        changed |= ui.checkbox(&mut self.settings.audio, "播放远端的声音").changed();
         changed |= ui
             .checkbox(&mut self.settings.native, "按原始分辨率传输")
             .on_hover_text("默认按窗口的实际像素尺寸编码：显示效果相同，延迟和带宽更低")
@@ -446,6 +447,9 @@ fn spawn_viewer(name: &str, addr: SocketAddr, settings: &config::Settings) -> Re
     }
     if settings.native {
         cmd.arg("--native");
+    }
+    if !settings.audio {
+        cmd.arg("--no-audio");
     }
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?;
     let stderr = Arc::new(Mutex::new(Vec::new()));

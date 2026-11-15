@@ -1,5 +1,6 @@
 //! 被控端：等待控制端连接，推送屏幕画面，注入键鼠输入。
 
+mod audio;
 mod clip;
 mod source;
 mod trust;
@@ -281,7 +282,7 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
             Err(e) => return Err(e.into()),
         };
     }
-    let ClientMsg::Auth { mac, udp_port } = auth else {
+    let ClientMsg::Auth { mac, udp_port, audio_port } = auth else {
         bail!("握手失败：期望 Auth");
     };
     if !proto::pair::ct_eq(&mac, &proto::pair::client_mac(&key, &nonce, &client_nonce)) {
@@ -330,6 +331,9 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
 
     // ---- 控制通道读线程：输入事件、关键帧请求、心跳 ----
     let alive = Arc::new(AtomicBool::new(true));
+    if audio_port != 0 {
+        audio::spawn(SocketAddr::new(peer.ip(), audio_port), alive.clone());
+    }
     // 控制端窗口尺寸，打包成 (w << 32 | h)；NO_VIEWPORT 表示还没收到。
     const NO_VIEWPORT: u64 = u64::MAX;
     let viewport = Arc::new(AtomicU64::new(NO_VIEWPORT));

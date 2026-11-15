@@ -24,11 +24,18 @@ pub struct Settings {
     /// 始终按原始分辨率传输
     #[serde(default)]
     pub native: bool,
+    /// 播放远端的声音
+    #[serde(default = "yes")]
+    pub audio: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { cmd_as_ctrl: true, native: false }
+        Self { cmd_as_ctrl: true, native: false, audio: true }
     }
 }
 

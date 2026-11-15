@@ -5,6 +5,7 @@
 //! - 视频通道：UDP，每帧切成 ≤ [`MAX_PAYLOAD`] 字节的分片，丢包时不重传，
 //!   由控制端请求关键帧恢复（局域网内重传的等待比重发一帧更贵）。
 
+pub mod audio;
 pub mod data;
 pub mod discovery;
 pub mod hevc;
@@ -16,7 +17,7 @@ pub mod video;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const DEFAULT_PORT: u16 = 47800;
 /// 局域网发现使用的 UDP 端口。
 pub const DISCOVERY_PORT: u16 = 47801;
@@ -59,8 +60,9 @@ pub enum ClientMsg {
     RequestPairing,
     /// 新连接的第一条消息：表示这是某个会话的数据通道（剪贴板、文件），`token` 来自 Welcome。
     DataHello { token: [u8; 16] },
-    /// `mac` 见 [`pair::client_mac`]；`udp_port` 为控制端接收视频的端口。
-    Auth { mac: [u8; 32], udp_port: u16 },
+    /// `mac` 见 [`pair::client_mac`]；`udp_port` 为控制端接收视频的端口；
+    /// `audio_port` 为接收声音的端口（0 表示不要声音）。
+    Auth { mac: [u8; 32], udp_port: u16, audio_port: u16 },
     Input(InputEvent),
     RequestKeyframe,
     Ping { t_us: u64 },

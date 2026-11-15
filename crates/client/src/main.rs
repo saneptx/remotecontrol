@@ -7,6 +7,8 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
+mod audio;
+#[cfg(target_os = "macos")]
 mod awdl;
 #[cfg(target_os = "macos")]
 mod config;
@@ -115,6 +117,9 @@ mod app {
         /// 连接后把这些文件 / 文件夹发送到远端“下载”（等同于拖进窗口）
         #[arg(long = "send", value_name = "路径")]
         send: Vec<std::path::PathBuf>,
+        /// 不播放远端的声音
+        #[arg(long)]
+        no_audio: bool,
         /// 连接后取回远端剪贴板里的文件（等同于 ⌘⇧D）
         #[arg(long, hide = true)]
         fetch: bool,
@@ -138,6 +143,8 @@ mod app {
         /// 触控板像素滚动的小数累积（单位：1/120 格）。
         wheel_acc: (f64, f64),
         data: Option<crate::datalink::DataLink>,
+        /// 声音播放流（丢弃即停止）
+        audio: Option<cpal::Stream>,
         mods: winit::keyboard::ModifiersState,
         /// 被本地快捷键吃掉的按键：抬起时也不发给远端
         swallowed: HashSet<winit::keyboard::KeyCode>,
@@ -147,7 +154,7 @@ mod app {
         // 告诉系统这是延迟敏感的前台任务：不做 App Nap、不合并定时器。
         let _activity = begin_latency_critical_activity();
         let addr = net::parse_addr(&args.host)?;
-        let conn = net::connect(addr, |ev| match ev {
+        let conn = net::connect(addr, !args.no_audio, |ev| match ev {
             net::HandshakeEvent::PairCode { host_name, code } => {
                 eprintln!("首次连接「{host_name}」需要配对：请在对方屏幕上确认配对码 {code} 并点“是”");
             }
@@ -171,6 +178,7 @@ mod app {
             buttons_down: HashSet::new(),
             wheel_acc: (0.0, 0.0),
             data: None,
+            audio: None,
             mods: Default::default(),
             swallowed: HashSet::new(),
         };
@@ -180,7 +188,7 @@ mod app {
 
     impl App {
         fn start(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
-            let conn = self.conn.take().context("重复初始化")?;
+            let mut conn = self.conn.take().context("重复初始化")?;
             let (vw, vh) = self.video_size;
             // 初始窗口：逻辑宽 1280，保持远端画面比例。
             let size = LogicalSize::new(1280.0, 1280.0 * vh as f64 / vw as f64);
@@ -194,6 +202,12 @@ mod app {
 
             let control = net::Control::new(conn.tcp.try_clone()?);
             self.shared.alive.store(true, Ordering::Relaxed);
+            if let Some(sock) = conn.audio.take() {
+                match crate::audio::start(sock, Arc::new(std::sync::atomic::AtomicBool::new(true))) {
+                    Ok(s) => self.audio = Some(s),
+                    Err(e) => eprintln!("声音不可用: {e:#}"),
+                }
+            }
             // 数据通道失败不影响远程画面，只是没有剪贴板和文件传输
             match crate::datalink::DataLink::open(conn.addr, conn.data_token) {
                 Ok(link) => {
