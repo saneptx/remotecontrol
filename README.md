@@ -50,6 +50,9 @@ rc-host.exe uninstall
 
 运行日志在 `C:\ProgramData\RemoteControl\host.log`（需要管理员权限查看）。
 
+**连不上时**：双击 `diagnose.cmd`（或在管理员终端运行 `rc-host.exe status`），它会检查服务是否运行、端口是否在监听、
+网络是否被识别为“公用网络”、防火墙规则是否存在，并显示最近的日志。
+
 **原理**：服务运行在看不到屏幕的 session 0 里，它在当前登录会话中以 SYSTEM 身份启动工作进程；
 SYSTEM 身份可以进入锁屏 / UAC 所在的安全桌面，工作进程在桌面切换时自动跟随，继续采集和注入输入。
 

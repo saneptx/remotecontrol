@@ -75,5 +75,6 @@ jobs:
             rc-host.exe
             install-service.cmd
             uninstall-service.cmd
+            diagnose.cmd
             rc-client-macos-arm64.tar.gz
           generate_release_notes: true

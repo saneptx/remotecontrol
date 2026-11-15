@@ -357,6 +357,27 @@ fn stop_and_wait(service: &windows_service::service::Service) -> Result<()> {
     Ok(())
 }
 
+/// 运行一段 PowerShell，返回其标准输出（强制 UTF-8，避免中文系统下的 GBK 乱码）。
+fn powershell(script: &str) -> String {
+    let script = format!("[Console]::OutputEncoding = [Text.Encoding]::UTF8; $ErrorActionPreference = 'SilentlyContinue'; {script}");
+    Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// 各网卡的网络类型：(网卡名, Public/Private/DomainAuthenticated)。
+fn network_profiles() -> Vec<(String, String)> {
+    powershell("Get-NetConnectionProfile | ForEach-Object { \"$($_.InterfaceAlias)`t$($_.NetworkCategory)\" }")
+        .lines()
+        .filter_map(|l| l.split_once('\t').map(|(a, b)| (a.trim().to_string(), b.trim().to_string())))
+        .collect()
+}
+
+const PUBLIC_NETWORK_HINT: &str = "防火墙规则只对“专用网络”生效，公用网络下控制端连不上。\n\
+     修改方法：设置 → 网络和 Internet → 以太网 / WLAN → 当前网络的“属性” → 网络配置文件类型选“专用网络”。";
+
 /// 静默运行一个系统命令，返回是否成功。
 fn quiet(program: &str, args: &[&str]) -> bool {
     Command::new(program).args(args).output().map(|o| o.status.success()).unwrap_or(false)
@@ -439,6 +460,7 @@ pub fn install(args: &Args) -> Result<()> {
     ]) {
         eprintln!("警告：添加防火墙规则失败，可能需要手动放行 TCP {} 入站", args.port);
     }
+    let public: Vec<String> = network_profiles().into_iter().filter(|(_, c)| c == "Public").map(|(n, _)| n).collect();
 
     // 4. 创建（或更新）服务：开机自动启动，以 LocalSystem 运行，崩溃后自动重启。
     let mut launch_arguments: Vec<OsString> = vec!["service".into()];
@@ -481,6 +503,132 @@ pub fn install(args: &Args) -> Result<()> {
     println!("现在锁屏、登录界面和 UAC 弹窗也能看到并操作了。");
     println!("提示：如果之前手动运行的 rc-host 还开着，请先关掉它，否则端口会冲突。");
     println!("修改密码或参数：重新执行 install 并带上新参数；卸载：rc-host uninstall");
+    println!("连不上时运行 rc-host status（或双击 diagnose.cmd）检查问题。");
+    if !public.is_empty() {
+        println!();
+        println!("⚠️  注意：网络「{}」当前是“公用网络”。", public.join("、"));
+        println!("{PUBLIC_NETWORK_HINT}");
+    }
+    Ok(())
+}
+
+/// `rc-host status`：检查服务、端口、网络类型与防火墙，并显示最近的日志。
+pub fn status() -> Result<()> {
+    let mut problems: Vec<String> = Vec::new();
+
+    // 1. 服务
+    println!("== 系统服务 ==");
+    let mut port = rc_protocol::DEFAULT_PORT;
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).map_err(admin_hint)?;
+    match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG) {
+        Ok(service) => {
+            let st = service.query_status()?;
+            let state = match st.current_state {
+                ServiceState::Running => "运行中",
+                ServiceState::Stopped => "已停止",
+                ServiceState::StartPending => "正在启动",
+                ServiceState::StopPending => "正在停止",
+                _ => "其它",
+            };
+            println!("状态：{state}");
+            if let Ok(cfg) = service.query_config() {
+                let cmdline = cfg.executable_path.to_string_lossy().to_string();
+                println!("命令：{cmdline}");
+                let mut it = cmdline.split_whitespace();
+                while let Some(tok) = it.next() {
+                    if tok == "--port" {
+                        if let Some(p) = it.next().and_then(|p| p.parse().ok()) {
+                            port = p;
+                        }
+                    }
+                }
+            }
+            if st.current_state != ServiceState::Running {
+                problems.push("服务没有运行：重新双击 install-service.cmd，或在“服务”管理器里启动「RemoteControl 被控端」".into());
+            }
+        }
+        Err(_) => {
+            println!("状态：未安装");
+            problems.push("系统服务未安装：双击 install-service.cmd 安装".into());
+        }
+    }
+
+    // 2. 端口是否在监听（能连上本机端口，说明被控端进程正常在等连接）
+    println!();
+    println!("== 端口 {port} ==");
+    let listening = std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_secs(2)).is_ok();
+    println!("{}", if listening { "正在监听" } else { "没有监听" });
+    if !listening {
+        problems.push(format!("端口 {port} 没有在监听：被控端进程没能正常运行，请看下方日志中的错误"));
+    }
+    let procs = powershell("Get-Process rc-host | ForEach-Object { \"PID $($_.Id)  会话 $($_.SessionId)  $($_.Path)\" }");
+    if !procs.is_empty() {
+        println!("rc-host 进程：");
+        for l in procs.lines() {
+            println!("  {l}");
+        }
+    }
+
+    // 3. 网络与防火墙
+    println!();
+    println!("== 网络 ==");
+    let ips = powershell(
+        "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | ForEach-Object { \"$($_.InterfaceAlias)`t$($_.IPAddress)\" }",
+    );
+    for l in ips.lines() {
+        if let Some((nic, ip)) = l.split_once('\t') {
+            println!("本机地址：{ip}（{nic}）");
+        }
+    }
+    for (nic, cat) in network_profiles() {
+        let name = match cat.as_str() {
+            "Public" => "公用网络 ⚠️",
+            "Private" => "专用网络",
+            "DomainAuthenticated" => "域网络",
+            other => other,
+        };
+        println!("网络类型：{nic} → {name}");
+        if cat == "Public" {
+            problems.push(format!("网络「{nic}」是公用网络。{PUBLIC_NETWORK_HINT}"));
+        }
+    }
+    let rule = powershell(&format!(
+        "Get-NetFirewallRule -DisplayName '{FIREWALL_RULE}' | ForEach-Object {{ \"启用 $($_.Enabled)  动作 $($_.Action)  网络 $($_.Profile)\" }}"
+    ));
+    if rule.is_empty() {
+        println!("防火墙规则：不存在");
+        problems.push("防火墙规则不存在：重新运行 install".into());
+    } else {
+        println!("防火墙规则：{rule}");
+    }
+
+    // 4. 日志
+    println!();
+    println!("== 最近日志（{}）==", log_file().display());
+    match std::fs::read(log_file()) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            let lines: Vec<&str> = text.lines().collect();
+            for l in &lines[lines.len().saturating_sub(30)..] {
+                println!("{l}");
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            println!("（需要管理员权限才能查看，请双击 diagnose.cmd）");
+        }
+        Err(_) => println!("（暂无日志）"),
+    }
+
+    println!();
+    if problems.is_empty() {
+        println!("✅ 被控端这边一切正常。如果 Mac 仍连不上，请确认两台机器在同一网段、地址填的是上面的“本机地址”，");
+        println!("   并在 Mac 上执行  nc -vz <本机地址> {port}  看端口是否可达。");
+    } else {
+        println!("发现以下问题：");
+        for (i, p) in problems.iter().enumerate() {
+            println!("{}. {p}", i + 1);
+        }
+    }
     Ok(())
 }
 

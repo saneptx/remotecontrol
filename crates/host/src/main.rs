@@ -32,6 +32,8 @@ enum Cmd {
     Install(Args),
     /// 卸载系统服务（需要管理员权限）
     Uninstall,
+    /// 检查服务、端口、网络与防火墙状态，排查连不上的问题
+    Status,
     /// 由 Windows 服务管理器调用，请勿手动运行
     #[command(hide = true)]
     Service(Args),
@@ -98,6 +100,8 @@ fn main() -> Result<()> {
         }
         #[cfg(windows)]
         Some(Cmd::Uninstall) => win::service::uninstall(),
+        #[cfg(windows)]
+        Some(Cmd::Status) => win::service::status(),
         #[cfg(windows)]
         Some(Cmd::Service(args)) => win::service::run(args),
         #[cfg(not(windows))]
