@@ -22,6 +22,14 @@ pub enum ClipData {
     Files { names: Vec<String>, total_bytes: u64 },
 }
 
+/// 本机剪贴板的变化（平台剪贴板模块产生）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClipEvent {
+    Data(ClipData),
+    /// 用户复制了文件（资源管理器 Ctrl+C / 访达 ⌘C）
+    Files(Vec<std::path::PathBuf>),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DataMsg {
     Clipboard(ClipData),

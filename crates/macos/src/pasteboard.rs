@@ -91,6 +91,25 @@ pub fn write(data: &ClipData) {
     }
 }
 
+/// 剪贴板里的文件（访达里 ⌘C 复制的）。
+pub fn read_files() -> Vec<PathBuf> {
+    let Some(pb) = general() else { return Vec::new() };
+    if !has_type(&pb, FILE_URL) {
+        return Vec::new();
+    }
+    let Some(cls) = AnyClass::get(c"NSURL") else { return Vec::new() };
+    let classes = class_array(cls);
+    let opts = NSDictionary::<NSString, AnyObject>::new();
+    let urls: Option<Retained<NSArray<NSURL>>> = unsafe { msg_send![&*pb, readObjectsForClasses: &*classes, options: &*opts] };
+    urls.map(|a| a.iter().filter_map(|u| u.path().map(|p| PathBuf::from(p.to_string()))).collect()).unwrap_or_default()
+}
+
+fn class_array(cls: &AnyClass) -> Retained<NSArray<AnyObject>> {
+    let obj: *const AnyClass = cls;
+    let obj = obj as *const AnyObject;
+    NSArray::from_slice(&[unsafe { &*obj }])
+}
+
 /// 把文件放进剪贴板，可在访达里 ⌘V 粘贴。
 pub fn write_files(paths: &[PathBuf]) {
     let Some(pb) = general() else { return };

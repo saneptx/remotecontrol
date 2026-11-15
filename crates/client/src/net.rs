@@ -116,7 +116,7 @@ fn handshake(addr: SocketAddr, mut on_event: impl FnMut(HandshakeEvent), pair_on
     let audio_port = audio.as_ref().and_then(|a| a.local_addr().ok()).map(|a| a.port()).unwrap_or(0);
     proto::write_msg(&mut tcp, &ClientMsg::Auth { mac, udp_port: udp.local_addr()?.port(), audio_port })?;
     match proto::read_msg(&mut tcp)? {
-        HostMsg::Welcome { width, height, fps, host_proof, data_token } => {
+        HostMsg::Welcome { width, height, fps, host_proof, data_token, video_port, audio_port } => {
             if !proto::pair::ct_eq(&host_proof, &proto::pair::host_proof(&key, &host_nonce, &client_nonce)) {
                 bail!("被控端身份验证失败：对方不是配对时的那台机器（可能被冒充），已中止连接");
             }
@@ -126,11 +126,31 @@ fn handshake(addr: SocketAddr, mut on_event: impl FnMut(HandshakeEvent), pair_on
                 eprintln!("已与「{host_name}」配对，以后可直接连接");
             }
             tcp.set_read_timeout(None)?;
+            spawn_punch(&udp, SocketAddr::new(addr.ip(), video_port));
+            if let Some(a) = &audio {
+                if audio_port != 0 {
+                    spawn_punch(a, SocketAddr::new(addr.ip(), audio_port));
+                }
+            }
             Ok(Some(Connection { tcp, udp, width, height, fps, host_name, addr, data_token, audio }))
         }
         HostMsg::Reject { reason } => bail!("被控端拒绝连接: {reason}"),
         other => bail!("握手失败: {other:?}"),
     }
+}
+
+/// UDP 打洞：每 3 秒从接收端口向被控端的发送端口发一个小包，让本机防火墙把对方的数据当作回复放行。
+/// 接收端口关闭（连接结束）后发送失败，线程随之退出。
+fn spawn_punch(sock: &UdpSocket, to: SocketAddr) {
+    let Ok(s) = sock.try_clone() else { return };
+    std::thread::spawn(move || {
+        for _ in 0..100_000 {
+            if s.send_to(b"rc-punch", to).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(3));
+        }
+    });
 }
 
 /// 局域网里发现的一台被控端。
@@ -283,6 +303,15 @@ pub struct Stats {
 
 
 /// 把当前线程标记为“用户交互”级 QoS，避免被系统降频或推迟调度。
+#[cfg(windows)]
+fn set_latency_critical_qos() {
+    use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST};
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn set_latency_critical_qos() {
     const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
     extern "C" {
@@ -315,7 +344,13 @@ pub fn spawn_video_receiver(
         let (mut frames, mut bytes, mut lost, mut recovered) = (0u32, 0usize, 0u32, 0u32);
         let (mut latency_sum, mut latency_max, mut host_sum) = (0i64, 0i64, 0i64);
         let mut window_start = Instant::now();
-        let mut awdl = crate::awdl::active();
+        let awdl_check = || {
+            #[cfg(target_os = "macos")]
+            return crate::awdl::active();
+            #[cfg(not(target_os = "macos"))]
+            return false;
+        };
+        let mut awdl = awdl_check();
         let mut awdl_warned = false;
         let mut stats_ticks = 0u32;
 
@@ -358,7 +393,7 @@ pub fn spawn_video_receiver(
             if elapsed >= Duration::from_secs(1) {
                 stats_ticks += 1;
                 if stats_ticks % 3 == 0 {
-                    awdl = crate::awdl::active();
+                    awdl = awdl_check();
                 }
                 if awdl && !awdl_warned {
                     awdl_warned = true;

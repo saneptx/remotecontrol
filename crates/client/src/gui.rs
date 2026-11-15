@@ -57,6 +57,7 @@ struct Gui {
     awdl_active: bool,
     awdl_checked: Instant,
     awdl_job: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    host_enabled: bool,
     job: Option<Arc<Mutex<Job>>>,
     sessions: Vec<Session>,
     message: Option<(String, bool)>,
@@ -77,6 +78,10 @@ impl Gui {
             awdl_active: awdl::active(),
             awdl_checked: Instant::now(),
             awdl_job: None,
+            #[cfg(target_os = "macos")]
+            host_enabled: crate::hostagent::enabled(),
+            #[cfg(not(target_os = "macos"))]
+            host_enabled: false,
             job: None,
             sessions: Vec::new(),
             message: None,
@@ -90,7 +95,7 @@ impl Gui {
     }
 
     /// 发起连接：未配对时先在本界面完成配对（显示配对码），然后启动远程画面窗口。
-    fn connect(&mut self, ctx: &egui::Context, name: String, host_id: Option<DeviceId>, addr: SocketAddr) {
+    fn connect(&mut self, ctx: &egui::Context, name: String, host_id: Option<DeviceId>, addr: SocketAddr, os: Option<String>) {
         self.message = None;
         let job = Arc::new(Mutex::new(Job::Connecting { name: name.clone() }));
         self.job = Some(job.clone());
@@ -113,7 +118,7 @@ impl Gui {
                     return set(Job::Failed { name, error: format!("{e:#}") });
                 }
             }
-            match spawn_viewer(&name, addr, &settings) {
+            match spawn_viewer(&name, addr, &settings, os.as_deref()) {
                 Ok(s) => set(Job::Started(s)),
                 Err(e) => set(Job::Failed { name, error: format!("{e:#}") }),
             }
@@ -194,7 +199,7 @@ impl Gui {
         }
 
         let busy = self.busy();
-        let mut action: Option<(String, Option<DeviceId>, SocketAddr)> = None;
+        let mut action: Option<(String, Option<DeviceId>, SocketAddr, Option<String>)> = None;
         let mut forget: Option<String> = None;
         for d in &online {
             let compatible = d.version == proto::PROTOCOL_VERSION;
@@ -207,7 +212,7 @@ impl Gui {
             };
             device_row(ui, &d.name, &d.os, &d.addr.to_string(), badge, d.paired && compatible, |ui| {
                 if ui.add_enabled(!busy && compatible, egui::Button::new("连接")).clicked() {
-                    action = Some((d.name.clone(), Some(d.host_id), d.addr));
+                    action = Some((d.name.clone(), Some(d.host_id), d.addr, Some(d.os.clone())));
                 }
                 if d.paired && ui.small_button("忘记").on_hover_text("删除本机保存的配对信息").clicked() {
                     forget = Some(proto::hex(&d.host_id));
@@ -219,15 +224,15 @@ impl Gui {
             device_row(ui, &k.name, "", &addr, "离线", false, |ui| {
                 let parsed = addr.parse::<SocketAddr>().ok();
                 if ui.add_enabled(!busy && parsed.is_some(), egui::Button::new("连接")).on_hover_text("按上次的地址尝试连接").clicked() {
-                    action = Some((k.name.clone(), proto::parse_hex16(&k.id), parsed.unwrap()));
+                    action = Some((k.name.clone(), proto::parse_hex16(&k.id), parsed.unwrap(), None));
                 }
                 if ui.small_button("忘记").clicked() {
                     forget = Some(k.id.clone());
                 }
             });
         }
-        if let Some((name, id, addr)) = action {
-            self.connect(ui.ctx(), name, id, addr);
+        if let Some((name, id, addr, os)) = action {
+            self.connect(ui.ctx(), name, id, addr, os);
         }
         if let Some(id) = forget {
             let _ = config::forget(&id);
@@ -236,7 +241,12 @@ impl Gui {
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
-        changed |= ui.checkbox(&mut self.settings.cmd_as_ctrl, "Command 键当作 Ctrl（⌘C / ⌘V 即复制粘贴）").changed();
+        let swap_label = if cfg!(target_os = "macos") {
+            "Command 键当作 Ctrl（⌘C / ⌘V 即复制粘贴）"
+        } else {
+            "控制 Mac 时 Ctrl 当作 Command（Ctrl+C / Ctrl+V 即复制粘贴）"
+        };
+        changed |= ui.checkbox(&mut self.settings.cmd_as_ctrl, swap_label).changed();
         changed |= ui.checkbox(&mut self.settings.audio, "播放远端的声音").changed();
         changed |= ui
             .checkbox(&mut self.settings.native, "按原始分辨率传输")
@@ -246,6 +256,9 @@ impl Gui {
             let _ = config::save_settings(&self.settings);
         }
 
+        if !cfg!(target_os = "macos") {
+            return;
+        }
         let mut guard = self.awdl_guard;
         let pending = self.awdl_job.is_some();
         ui.horizontal(|ui| {
@@ -281,6 +294,57 @@ impl Gui {
             ("当前 AWDL：关闭", Color32::from_rgb(40, 140, 60))
         };
         ui.label(RichText::new(text).small().color(color));
+    }
+}
+
+impl Gui {
+    #[cfg(windows)]
+    fn host_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::winhost;
+        let state = winhost::service_state();
+        ui.horizontal(|ui| {
+            ui.label("允许其他设备控制这台电脑（系统服务）：");
+            ui.label(RichText::new(state.unwrap_or("未安装")).strong());
+        });
+        ui.horizontal(|ui| {
+            let (label, args) = if state.is_some() { ("卸载", "uninstall") } else { ("安装并启动", "install") };
+            if ui.button(label).on_hover_text("需要管理员权限（会弹出确认）").clicked() {
+                if let Err(e) = winhost::run_elevated(args) {
+                    self.message = Some((format!("{e:#}"), true));
+                }
+            }
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    fn host_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::hostagent;
+        let mut on = self.host_enabled;
+        if ui
+            .checkbox(&mut on, "允许其他设备控制这台 Mac")
+            .on_hover_text("登录后自动在后台运行被控端。其他电脑首次连接时，这里会弹窗请你确认配对码。")
+            .changed()
+        {
+            match hostagent::set_enabled(on) {
+                Ok(()) => self.host_enabled = on,
+                Err(e) => self.message = Some((format!("{e:#}"), true)),
+            }
+        }
+        if self.host_enabled {
+            ui.label(RichText::new("首次开启需要在系统设置中允许 rc-host 使用以下两项权限，授权后重新开启一次本开关：").small().weak());
+            ui.horizontal(|ui| {
+                if ui.small_button("录屏与系统录音…").clicked() {
+                    let _ = Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture").spawn();
+                }
+                if ui.small_button("辅助功能…").clicked() {
+                    let _ = Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility").spawn();
+                }
+            });
+            // 被控端日志里最近的权限 / 错误提示
+            if let Some(line) = hostagent::log_tail(30).into_iter().rev().find(|l| l.contains("权限") || l.contains("失败")) {
+                ui.label(RichText::new(line).small().color(Color32::from_rgb(200, 120, 0)));
+            }
+        }
     }
 }
 
@@ -334,7 +398,7 @@ impl eframe::App for Gui {
                         match net::parse_addr(self.manual_addr.trim()) {
                             Ok(addr) => {
                                 let name = self.manual_addr.trim().to_string();
-                                self.connect(&ctx, name, None, addr);
+                                self.connect(&ctx, name, None, addr, None);
                             }
                             Err(e) => self.message = Some((format!("地址无效：{e:#}"), true)),
                         }
@@ -344,6 +408,10 @@ impl eframe::App for Gui {
                 ui.add_space(12.0);
                 ui.label(RichText::new("设置").strong());
                 self.settings_ui(ui);
+
+                ui.add_space(12.0);
+                ui.label(RichText::new("被控制").strong());
+                self.host_ui(ui);
 
                 if !self.sessions.is_empty() {
                     ui.add_space(12.0);
@@ -439,11 +507,17 @@ fn spawn_scanner(seen: Arc<Mutex<HashMap<DeviceId, Seen>>>, ctx: egui::Context) 
 }
 
 /// 启动远程画面窗口进程。
-fn spawn_viewer(name: &str, addr: SocketAddr, settings: &config::Settings) -> Result<Session> {
+fn spawn_viewer(name: &str, addr: SocketAddr, settings: &config::Settings, host_os: Option<&str>) -> Result<Session> {
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("view").arg(addr.to_string());
-    if settings.cmd_as_ctrl {
+    // Mac 控制任何系统时都按习惯互换；Windows 只在控制 Mac 时互换（控制 Windows 时 Ctrl 就是 Ctrl）
+    if settings.cmd_as_ctrl && (cfg!(target_os = "macos") || host_os == Some("macos")) {
         cmd.arg("--cmd-as-ctrl");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // 不弹出控制台窗口
     }
     if settings.native {
         cmd.arg("--native");

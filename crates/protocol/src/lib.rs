@@ -17,7 +17,7 @@ pub mod video;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const DEFAULT_PORT: u16 = 47800;
 /// 局域网发现使用的 UDP 端口。
 pub const DISCOVERY_PORT: u16 = 47801;
@@ -78,7 +78,9 @@ pub enum HostMsg {
     /// 控制端未配对：附被控端的 X25519 临时公钥，等待控制端的 `PairKey`。
     PairRequired { host_id: DeviceId, host_name: String, public_key: [u8; 32] },
     /// `host_proof` 见 [`pair::host_proof`]；`data_token` 用于打开数据通道。
-    Welcome { width: u32, height: u32, fps: u32, host_proof: [u8; 32], data_token: [u8; 16] },
+    /// `video_port` / `audio_port` 是被控端发送视频、声音所用的 UDP 端口：控制端先从自己的接收端口
+    /// 往这里发小包（UDP 打洞），本机防火墙就会把对方发来的数据当作回复放行，无需添加防火墙规则。
+    Welcome { width: u32, height: u32, fps: u32, host_proof: [u8; 32], data_token: [u8; 16], video_port: u16, audio_port: u16 },
     Reject { reason: String },
     /// `t_us` 原样返回，`host_us` 为被控端时钟，用于估算两端时钟差。
     Pong { t_us: u64, host_us: u64 },

@@ -4,8 +4,8 @@
 //! 只有同一用户的进程才能取到，SYSTEM 只能看到一个空壳格式。所以剪贴板读写交给一个
 //! 以登录用户身份运行的助手进程（`rc-host clip-helper`），两者通过标准输入输出管道通信。
 
-use super::clipboard::Clipboard;
 use crate::clip::{ClipEvent, ClipboardBackend};
+use rc_windows::clipboard::Clipboard;
 use rc_protocol::data::ClipData;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs::File;

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/host", "crates/client"]
+members = ["crates/protocol", "crates/host", "crates/client", "crates/macos", "crates/windows"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 socket2 = "0.5"
 rc-protocol = { path = "crates/protocol" }
+rc-macos = { path = "crates/macos" }
+rc-windows = { path = "crates/windows" }
 
 [profile.release]
 opt-level = 3

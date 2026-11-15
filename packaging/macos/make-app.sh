@@ -5,12 +5,13 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
 
-cargo build --release -p rc-client
+cargo build --release -p rc-client -p rc-host
 VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 APP=target/RemoteControl.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/rc-client "$APP/Contents/MacOS/rc-client"
+cp target/release/rc-host "$APP/Contents/MacOS/rc-host"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -33,7 +34,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 
 # 本地临时签名：系统权限（本地网络等）才能稳定地记在这个应用上
-codesign --force --deep --sign - "$APP" >/dev/null
+codesign --force --sign - --identifier com.remotecontrol.host "$APP/Contents/MacOS/rc-host" >/dev/null
+codesign --force --sign - "$APP" >/dev/null
 echo "已生成 $APP"
 
 if [ "${1:-}" = "--install" ]; then

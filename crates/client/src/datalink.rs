@@ -1,11 +1,11 @@
 //! 数据通道（控制端）：剪贴板双向同步、拖放上传、取回远端复制的文件。
 
-use crate::pasteboard;
+use crate::localclip::{self, LocalClipboard};
 use rc_protocol::data::{self, ClipData, DataMsg};
 use rc_protocol::transfer::{self, Event};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,13 +19,7 @@ pub struct DataLink {
     next_transfer: Arc<AtomicU32>,
     pending_drop: Arc<Mutex<Vec<PathBuf>>>,
     alive: Arc<AtomicBool>,
-}
-
-/// 收到的文件放在“下载”文件夹（可用环境变量 RC_DOWNLOADS 改到别处）。
-fn downloads() -> PathBuf {
-    std::env::var_os("RC_DOWNLOADS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Downloads"))
+    local: Arc<Mutex<Option<LocalClipboard>>>,
 }
 
 fn size_text(bytes: u64) -> String {
@@ -48,11 +42,15 @@ impl DataLink {
             next_transfer: Arc::new(AtomicU32::new(1)),
             pending_drop: Default::default(),
             alive: Arc::new(AtomicBool::new(true)),
+            local: Default::default(),
         };
-        // 最近一次由本程序写入剪贴板后的变化计数：本地变化与它相同就不回传
-        let ours = Arc::new(AtomicIsize::new(pasteboard::change_count()));
-        link.spawn_watcher(ours.clone());
-        link.spawn_reader(stream, ours);
+        // 本机剪贴板变化时发给对方
+        let sender = link.clone();
+        let local = LocalClipboard::spawn(Box::new(move |d| {
+            let _ = sender.send(&DataMsg::Clipboard(d));
+        }));
+        *link.local.lock().unwrap() = Some(local);
+        link.spawn_reader(stream);
         Ok(link)
     }
 
@@ -64,34 +62,10 @@ impl DataLink {
         *self.status.lock().unwrap() = s;
     }
 
-    /// 每 300ms 检查一次本机剪贴板，有变化就发给对方。
-    fn spawn_watcher(&self, ours: Arc<AtomicIsize>) {
+    fn spawn_reader(&self, mut stream: TcpStream) {
         let link = self.clone();
         std::thread::spawn(move || {
-            let mut last = pasteboard::change_count();
-            while link.alive.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(300));
-                let now = pasteboard::change_count();
-                if now == last {
-                    continue;
-                }
-                last = now;
-                if now == ours.load(Ordering::Relaxed) {
-                    continue;
-                }
-                if let Some(d) = pasteboard::read() {
-                    if link.send(&DataMsg::Clipboard(d)).is_err() {
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    fn spawn_reader(&self, mut stream: TcpStream, ours: Arc<AtomicIsize>) {
-        let link = self.clone();
-        std::thread::spawn(move || {
-            let mut receiver = transfer::Receiver::new(downloads());
+            let mut receiver = transfer::Receiver::new(localclip::downloads());
             while let Ok(msg) = data::read(&mut stream) {
                 match msg {
                     DataMsg::Clipboard(ClipData::Files { names, total_bytes }) => {
@@ -100,8 +74,9 @@ impl DataLink {
                     DataMsg::Clipboard(d) => {
                         // 远端复制了别的内容，之前提示的文件作废
                         *link.remote_files.lock().unwrap() = None;
-                        pasteboard::write(&d);
-                        ours.store(pasteboard::change_count(), Ordering::Relaxed);
+                        if let Some(l) = link.local.lock().unwrap().as_ref() {
+                            l.set(&d);
+                        }
                     }
                     DataMsg::FetchClipboardFiles => {} // 被控端不会向控制端要文件
                     other => match receiver.handle(other) {
@@ -114,9 +89,11 @@ impl DataLink {
                         Some(Event::Done { items, .. }) => {
                             let names: Vec<String> =
                                 items.iter().filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string())).collect();
-                            pasteboard::write_files(&items);
-                            ours.store(pasteboard::change_count(), Ordering::Relaxed);
-                            link.set_status(Some(format!("已保存到“下载”：{}（可在访达里 ⌘V 粘贴）", names.join("、"))));
+                            if let Some(l) = link.local.lock().unwrap().as_ref() {
+                                l.set_files(&items);
+                            }
+                            let paste = if cfg!(windows) { "可在资源管理器里 Ctrl+V 粘贴" } else { "可在访达里 ⌘V 粘贴" };
+                            link.set_status(Some(format!("已保存到“下载”：{}（{paste}）", names.join("、"))));
                         }
                         Some(Event::Failed { reason, .. }) => link.set_status(Some(format!("接收失败：{reason}"))),
                         None => {}
@@ -175,6 +152,7 @@ impl DataLink {
 
     pub fn close(&self) {
         self.alive.store(false, Ordering::Relaxed);
+        self.local.lock().unwrap().take();
         let _ = self.writer.lock().unwrap().shutdown(std::net::Shutdown::Both);
     }
 }

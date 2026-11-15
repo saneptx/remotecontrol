@@ -1,8 +1,8 @@
 //! 声音采集（被控端）：Windows 上用 WASAPI 环回录下系统正在播放的声音，打包成 PCM 发给控制端。
-//! 非 Windows 平台（测试图像源）发送 440 Hz 测试音。
+//! macOS 上用 ScreenCaptureKit 采集系统声音；测试图像源模式发送 440 Hz 测试音。
 
 use rc_protocol::audio::{self, MAX_FRAMES};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,22 +27,21 @@ impl Sender {
 }
 
 /// 在后台线程采集并发送，直到 `alive` 变为 false。
-pub fn spawn(dest: SocketAddr, alive: Arc<AtomicBool>) {
+/// `udp` 已 connect 到控制端的声音端口。
+pub fn spawn(udp: UdpSocket, alive: Arc<AtomicBool>) {
     std::thread::spawn(move || {
-        if let Err(e) = run(dest, &alive) {
+        if let Err(e) = run(udp, &alive) {
             eprintln!("声音不可用: {e:#}");
         }
     });
 }
 
 #[cfg(windows)]
-fn run(dest: SocketAddr, alive: &AtomicBool) -> anyhow::Result<()> {
+fn run(udp: UdpSocket, alive: &AtomicBool) -> anyhow::Result<()> {
     use anyhow::Context;
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::SampleFormat;
 
-    let udp = UdpSocket::bind("0.0.0.0:0")?;
-    udp.connect(dest)?;
     let host = cpal::default_host();
     let device = host.default_output_device().context("没有默认的播放设备")?;
     let cfg = device.default_output_config().context("读取播放设备格式")?;
@@ -85,10 +84,66 @@ fn run(dest: SocketAddr, alive: &AtomicBool) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn run(udp: UdpSocket, alive: &AtomicBool) -> anyhow::Result<()> {
+    if crate::test_source() {
+        return run_tone(udp, alive);
+    }
+    use screencapturekit::prelude::*;
+    let content = SCShareableContent::get().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let display = content.displays().into_iter().next().ok_or_else(|| anyhow::anyhow!("没有显示器"))?;
+    let filter = SCContentFilter::create().with_display(&display).with_excluding_windows(&[]).build().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    // 只要声音：画面设成最小、每秒一帧
+    let config = SCStreamConfiguration::new()
+        .with_width(2)
+        .with_height(2)
+        .with_minimum_frame_interval(&CMTime::new(1, 1))
+        .with_captures_audio(true)
+        .with_sample_rate(48_000)
+        .with_channel_count(2)
+        .with_excludes_current_process_audio(true);
+    let sender = std::sync::Mutex::new(Sender { udp, rate: 48_000, seq: 0, pending: Vec::new() });
+    let mut stream = SCStream::new(&filter, &config).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    stream
+        .add_output_handler(
+            move |sample: CMSampleBuffer, ty: SCStreamOutputType| {
+                if ty != SCStreamOutputType::Audio {
+                    return;
+                }
+                let Ok(list) = sample.audio_buffer_list() else { return };
+                let as_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
+                // 通常是两个非交错缓冲（每声道一个）；也兼容单个交错缓冲
+                let (Some(a), b) = (list.get(0), list.get(1)) else { return };
+                let left = as_f32(a.data());
+                let stereo: Vec<i16> = match b {
+                    Some(b) => {
+                        let right = as_f32(b.data());
+                        left.iter().zip(&right).flat_map(|(l, r)| [audio::f32_to_i16(*l), audio::f32_to_i16(*r)]).collect()
+                    }
+                    None if a.number_channels >= 2 => left.iter().map(|s| audio::f32_to_i16(*s)).collect(),
+                    None => left.iter().flat_map(|s| [audio::f32_to_i16(*s); 2]).collect(),
+                };
+                sender.lock().unwrap().push(stereo.into_iter());
+            },
+            SCStreamOutputType::Audio,
+        )
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    stream.start_capture().map_err(|e| anyhow::anyhow!("开始采集声音失败: {e:?}"))?;
+    println!("声音：系统声音采集 48000 Hz，2 声道");
+    while alive.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _ = stream.stop_capture();
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn run(udp: UdpSocket, alive: &AtomicBool) -> anyhow::Result<()> {
+    run_tone(udp, alive)
+}
+
 #[cfg(not(windows))]
-fn run(dest: SocketAddr, alive: &AtomicBool) -> anyhow::Result<()> {
-    let udp = UdpSocket::bind("0.0.0.0:0")?;
-    udp.connect(dest)?;
+fn run_tone(udp: UdpSocket, alive: &AtomicBool) -> anyhow::Result<()> {
     let rate = 48_000u32;
     let mut sender = Sender { udp, rate, seq: 0, pending: Vec::new() };
     let mut phase = 0f32;

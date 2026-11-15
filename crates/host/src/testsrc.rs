@@ -26,7 +26,9 @@ impl TestSource {
         let mut child = Command::new("ffmpeg")
             .args(["-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i"])
             .arg(format!("testsrc2=size={WIDTH}x{HEIGHT}:rate={fps}"))
-            .args(["-pix_fmt", "yuv444p", "-c:v", "libx265", "-preset", "ultrafast", "-tune", "zerolatency"])
+            // RC_TEST_420=1：输出 4:2:0（Windows 控制端的系统解码器不支持 4:4:4）
+            .args(["-pix_fmt", if std::env::var("RC_TEST_420").is_ok_and(|v| v == "1") { "yuv420p" } else { "yuv444p" }])
+            .args(["-c:v", "libx265", "-preset", "ultrafast", "-tune", "zerolatency"])
             .args(["-b:v", &format!("{}M", args.bitrate.min(30))])
             .args(["-x265-params", &format!("keyint={fps}:min-keyint={fps}:repeat-headers=1:aud=1:log-level=error")])
             .args(["-f", "hevc", "-"])

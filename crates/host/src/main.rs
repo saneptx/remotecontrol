@@ -6,6 +6,8 @@ mod source;
 mod trust;
 #[cfg(not(windows))]
 mod testsrc;
+#[cfg(target_os = "macos")]
+mod mac;
 #[cfg(windows)]
 mod nvenc_sys;
 #[cfg(windows)]
@@ -146,6 +148,11 @@ fn run_host(args: Args) -> Result<()> {
     now_us();
     #[cfg(windows)]
     win::power::init(!args.allow_sleep);
+    #[cfg(target_os = "macos")]
+    if !test_source() {
+        mac::power::init(!args.allow_sleep);
+        mac::request_permissions();
+    }
     let store = Arc::new(trust::Store::open(args.name.clone())?);
 
     let listener = TcpListener::bind(("0.0.0.0", args.port)).with_context(|| format!("监听端口 {} 失败（是否已有被控端或系统服务在运行？）", args.port))?;
@@ -319,20 +326,37 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
             }
         });
     }
-    proto::write_msg(&mut tcp, &HostMsg::Welcome { width, height, fps: video_src.fps(), host_proof, data_token })?;
+    // 视频与声音的发送端口在 Welcome 里告诉控制端，供它打洞穿过本机防火墙
+    let udp = UdpSocket::bind("0.0.0.0:0")?;
+    socket2::SockRef::from(&udp).set_send_buffer_size(4 << 20).ok();
+    udp.connect(SocketAddr::new(peer.ip(), udp_port))?;
+    let audio_udp = match audio_port {
+        0 => None,
+        p => {
+            let s = UdpSocket::bind("0.0.0.0:0")?;
+            s.connect(SocketAddr::new(peer.ip(), p))?;
+            Some(s)
+        }
+    };
+    let welcome = HostMsg::Welcome {
+        width,
+        height,
+        fps: video_src.fps(),
+        host_proof,
+        data_token,
+        video_port: udp.local_addr()?.port(),
+        audio_port: audio_udp.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port()).unwrap_or(0),
+    };
+    proto::write_msg(&mut tcp, &welcome)?;
     // 会话期间保持显示器常亮
     #[cfg(windows)]
     let _awake = win::power::SessionAwake::new();
     tcp.set_read_timeout(None)?;
 
-    let udp = UdpSocket::bind("0.0.0.0:0")?;
-    socket2::SockRef::from(&udp).set_send_buffer_size(4 << 20).ok();
-    udp.connect(SocketAddr::new(peer.ip(), udp_port))?;
-
     // ---- 控制通道读线程：输入事件、关键帧请求、心跳 ----
     let alive = Arc::new(AtomicBool::new(true));
-    if audio_port != 0 {
-        audio::spawn(SocketAddr::new(peer.ip(), audio_port), alive.clone());
+    if let Some(a) = audio_udp {
+        audio::spawn(a, alive.clone());
     }
     // 控制端窗口尺寸，打包成 (w << 32 | h)；NO_VIEWPORT 表示还没收到。
     const NO_VIEWPORT: u64 = u64::MAX;
@@ -502,8 +526,18 @@ fn open_platform(args: &Args) -> Result<(Box<dyn VideoSource>, Box<dyn InputSink
     Ok((Box::new(src), Box::new(input)))
 }
 
+/// 测试图像源（ffmpeg testsrc2 + 440 Hz 测试音），用于没有真实屏幕权限时联调：RC_TEST_SOURCE=1。
+pub fn test_source() -> bool {
+    !cfg!(any(windows, target_os = "macos")) || std::env::var("RC_TEST_SOURCE").is_ok_and(|v| v == "1")
+}
+
 #[cfg(not(windows))]
 fn open_platform(args: &Args) -> Result<(Box<dyn VideoSource>, Box<dyn InputSink>)> {
-    eprintln!("注意：非 Windows 平台，仅提供测试图像源（ffmpeg testsrc2），输入事件只打印不注入。");
+    #[cfg(target_os = "macos")]
+    if !test_source() {
+        let src = mac::MacSource::new(args)?;
+        return Ok((Box::new(src), Box::new(mac::input::Injector::new())));
+    }
+    eprintln!("注意：使用测试图像源（ffmpeg testsrc2），输入事件只打印不注入。");
     Ok((Box::new(testsrc::TestSource::new(args)?), Box::new(testsrc::LogInput)))
 }

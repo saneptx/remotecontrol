@@ -36,6 +36,7 @@ pub fn to_scancode(key: KeyCode, cmd_as_ctrl: bool) -> Option<(u16, bool)> {
         BracketLeft => plain(0x1a),
         BracketRight => plain(0x1b),
         Enter => plain(0x1c),
+        ControlLeft if cmd_as_ctrl && cfg!(windows) => ext(0x5b),
         ControlLeft => plain(0x1d),
         KeyA => plain(0x1e),
         KeyS => plain(0x1f),
@@ -100,6 +101,7 @@ pub fn to_scancode(key: KeyCode, cmd_as_ctrl: bool) -> Option<(u16, bool)> {
         F15 => plain(0x66),
 
         NumpadEnter => ext(0x1c),
+        ControlRight if cmd_as_ctrl && cfg!(windows) => ext(0x5c),
         ControlRight => ext(0x1d),
         NumpadDivide => ext(0x35),
         PrintScreen => ext(0x37),
@@ -116,7 +118,8 @@ pub fn to_scancode(key: KeyCode, cmd_as_ctrl: bool) -> Option<(u16, bool)> {
         Delete => ext(0x53),
         ContextMenu => ext(0x5d),
 
-        // Mac 的 Command：默认当作 Win 键；--cmd-as-ctrl 时当作 Ctrl（Cmd+C 即 Ctrl+C）。
+        // 修饰键按对方系统的习惯互换（cmd_as_ctrl）：
+        // Mac 上 Command → Ctrl（⌘C 即 Ctrl+C）；Windows 上 Ctrl → Win 键，被控的 Mac 收到的就是 Command。
         SuperLeft if cmd_as_ctrl => plain(0x1d),
         SuperRight if cmd_as_ctrl => ext(0x1d),
         SuperLeft => ext(0x5b),

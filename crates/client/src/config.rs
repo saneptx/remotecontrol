@@ -1,5 +1,6 @@
 //! 控制端配置：本机设备标识、已配对的被控端（含配对密钥）与界面设置。
-//! 保存在 `~/Library/Application Support/RemoteControl/client.json`（仅当前用户可读）。
+//! 保存在 `~/Library/Application Support/RemoteControl/client.json`（macOS）或
+//! `%APPDATA%\RemoteControl\client.json`（Windows），仅当前用户可读。
 
 use anyhow::{Context, Result};
 use rc_protocol::{self as proto, pair::Key, DeviceId};
@@ -49,8 +50,15 @@ struct File {
 }
 
 pub fn config_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    home.join("Library/Application Support/RemoteControl")
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("RemoteControl")
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        home.join("Library/Application Support/RemoteControl")
+    }
 }
 
 fn path() -> PathBuf {
@@ -96,6 +104,9 @@ pub fn device_id() -> Result<DeviceId> {
 }
 
 pub fn device_name() -> String {
+    #[cfg(windows)]
+    return std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".into());
+    #[cfg(not(windows))]
     std::process::Command::new("scutil")
         .args(["--get", "ComputerName"])
         .output()

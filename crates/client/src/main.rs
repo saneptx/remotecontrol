@@ -1,31 +1,55 @@
-//! 控制端（macOS）：显示远端画面并回传键鼠输入。
+//! 控制端（macOS / Windows）：图形界面、远程画面窗口、剪贴板与文件、声音。
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn main() {
-    eprintln!("控制端目前只支持 macOS。");
+    eprintln!("控制端只支持 macOS 和 Windows。");
     std::process::exit(1);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod audio;
 #[cfg(target_os = "macos")]
 mod awdl;
-#[cfg(target_os = "macos")]
+/// Windows 上没有 AWDL
+#[cfg(windows)]
+mod awdl {
+    pub fn guard_installed() -> bool {
+        false
+    }
+    pub fn guard_outdated() -> bool {
+        false
+    }
+    pub fn active() -> bool {
+        false
+    }
+    pub fn set_enabled(_: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+#[cfg(any(target_os = "macos", windows))]
 mod config;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod datalink;
 #[cfg(target_os = "macos")]
+#[path = "display_mac.rs"]
 mod display;
-#[cfg(target_os = "macos")]
+#[cfg(windows)]
+#[path = "display_win.rs"]
+mod display;
+#[cfg(any(target_os = "macos", windows))]
 mod gui;
 #[cfg(target_os = "macos")]
+mod hostagent;
+#[cfg(any(target_os = "macos", windows))]
 mod keymap;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
+mod localclip;
+#[cfg(any(target_os = "macos", windows))]
 mod net;
-#[cfg(target_os = "macos")]
-mod pasteboard;
+#[cfg(windows)]
+mod winhost;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[derive(clap::Parser, Debug)]
 #[command(about = "局域网远程控制 - 控制端（不带参数运行时打开图形界面）")]
 struct Cli {
@@ -33,7 +57,7 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[derive(clap::Subcommand, Debug)]
 enum Cmd {
     /// 连接被控端并显示远程画面
@@ -46,7 +70,7 @@ enum Cmd {
     Forget { query: String },
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn main() -> anyhow::Result<()> {
     use clap::Parser;
     match Cli::parse().cmd {
@@ -84,7 +108,7 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod app {
     use crate::{display::VideoSink, keymap, net};
     use anyhow::{Context, Result};
@@ -97,6 +121,7 @@ mod app {
     use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
     use winit::event_loop::{ActiveEventLoop, EventLoop};
     use winit::keyboard::PhysicalKey;
+    #[cfg(target_os = "macos")]
     use winit::platform::macos::EventLoopBuilderExtMacOS;
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::{Window, WindowId};
@@ -105,8 +130,9 @@ mod app {
     pub struct ViewArgs {
         /// 被控端地址，如 192.168.1.20 或 192.168.1.20:47800
         host: String,
-        /// 把 Command 键当作 Ctrl 发送（默认当作 Win 键）
-        #[arg(long)]
+        /// 按对方系统的习惯映射修饰键：Mac 控制 Windows 时 Command → Ctrl；
+        /// Windows 控制 Mac 时 Ctrl → Command（⌘C / Ctrl+C 都是复制）
+        #[arg(long, alias = "swap-modifiers")]
         cmd_as_ctrl: bool,
         /// 每秒在终端打印一行统计信息
         #[arg(long)]
@@ -124,6 +150,9 @@ mod app {
         #[arg(long, hide = true)]
         fetch: bool,
     }
+
+    /// 取回远端复制的文件的快捷键（显示用）。
+    const FETCH_KEY: &str = if cfg!(target_os = "macos") { "⌘⇧D" } else { "Ctrl+Alt+D" };
 
     enum UserEvent {
         Disconnected,
@@ -152,6 +181,7 @@ mod app {
 
     pub fn run(args: ViewArgs) -> Result<()> {
         // 告诉系统这是延迟敏感的前台任务：不做 App Nap、不合并定时器。
+        #[cfg(target_os = "macos")]
         let _activity = begin_latency_critical_activity();
         let addr = net::parse_addr(&args.host)?;
         let conn = net::connect(addr, !args.no_audio, |ev| match ev {
@@ -163,7 +193,7 @@ mod app {
 
         let event_loop = EventLoop::<UserEvent>::with_user_event()
             // 不要默认菜单：否则 Cmd+Q / Cmd+W / Cmd+H 会被本地菜单吃掉，发不到远端。
-            .with_default_menu(false)
+            .with_default_menu_if_mac()
             .build()?;
         let mut app = App {
             video_size: (conn.width, conn.height),
@@ -195,10 +225,13 @@ mod app {
             let attrs = Window::default_attributes().with_title(format!("远程控制 - {}", self.host_name)).with_inner_size(size);
             let window = Arc::new(event_loop.create_window(attrs)?);
 
-            let RawWindowHandle::AppKit(handle) = window.window_handle()?.as_raw() else {
-                anyhow::bail!("不是 AppKit 窗口");
+            let sink = match window.window_handle()?.as_raw() {
+                #[cfg(target_os = "macos")]
+                RawWindowHandle::AppKit(h) => unsafe { VideoSink::attach(h.ns_view.as_ptr())? },
+                #[cfg(windows)]
+                RawWindowHandle::Win32(h) => unsafe { VideoSink::attach(h.hwnd.get() as *mut std::ffi::c_void)? },
+                _ => anyhow::bail!("不支持的窗口类型"),
             };
-            let sink = unsafe { VideoSink::attach(handle.ns_view.as_ptr())? };
 
             let control = net::Control::new(conn.tcp.try_clone()?);
             self.shared.alive.store(true, Ordering::Relaxed);
@@ -267,7 +300,7 @@ mod app {
                     if let Some((names, bytes)) = link.remote_files.lock().unwrap().as_ref() {
                         let first = names.first().cloned().unwrap_or_default();
                         let more = if names.len() > 1 { format!(" 等 {} 项", names.len()) } else { String::new() };
-                        line = format!("远端复制了「{first}」{more}（{:.1} MB），按 ⌘⇧D 保存到本机 · {line}", *bytes as f64 / 1e6);
+                        line = format!("远端复制了「{first}」{more}（{:.1} MB），按 {FETCH_KEY} 保存到本机 · {line}", *bytes as f64 / 1e6);
                     }
                     if let Some(st) = link.status.lock().unwrap().as_ref() {
                         line = format!("{st} · {line}");
@@ -323,6 +356,20 @@ mod app {
         }
     }
 
+    /// 只在 macOS 上关闭默认菜单（否则 ⌘Q / ⌘W / ⌘H 会被本地菜单吃掉，发不到远端）。
+    trait DefaultMenu {
+        fn with_default_menu_if_mac(&mut self) -> &mut Self;
+    }
+
+    impl DefaultMenu for winit::event_loop::EventLoopBuilder<UserEvent> {
+        fn with_default_menu_if_mac(&mut self) -> &mut Self {
+            #[cfg(target_os = "macos")]
+            self.with_default_menu(false);
+            self
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn begin_latency_critical_activity() -> Option<objc2::rc::Retained<objc2::runtime::AnyObject>> {
         use objc2::runtime::{AnyClass, AnyObject};
         use objc2::msg_send;
@@ -426,8 +473,13 @@ mod app {
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
                     let PhysicalKey::Code(code) = event.physical_key else { return };
-                    // ⌘⇧D：取回远端复制的文件（本地快捷键，不发给远端）
-                    if code == winit::keyboard::KeyCode::KeyD && self.mods.super_key() && self.mods.shift_key() {
+                    // ⌘⇧D（Windows 上 Ctrl+Alt+D）：取回远端复制的文件（本地快捷键，不发给远端）
+                    let fetch_mods = if cfg!(target_os = "macos") {
+                        self.mods.super_key() && self.mods.shift_key()
+                    } else {
+                        self.mods.control_key() && self.mods.alt_key()
+                    };
+                    if code == winit::keyboard::KeyCode::KeyD && fetch_mods {
                         if event.state == ElementState::Pressed && !event.repeat {
                             self.swallowed.insert(code);
                             if let Some(d) = &self.data {

@@ -6,13 +6,7 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-/// 本机剪贴板的变化。
-#[cfg_attr(not(windows), allow(dead_code))]
-pub enum ClipEvent {
-    Data(ClipData),
-    /// 用户复制了文件（资源管理器里 Ctrl+C）
-    Files(Vec<PathBuf>),
-}
+pub use rc_protocol::data::ClipEvent;
 
 pub trait ClipboardBackend: Send + Sync {
     fn set(&self, data: ClipData);
@@ -26,7 +20,7 @@ pub trait ClipboardBackend: Send + Sync {
 pub fn downloads_dir() -> PathBuf {
     #[cfg(windows)]
     {
-        crate::win::clipboard::user_downloads_dir()
+        rc_windows::clipboard::user_downloads_dir()
     }
     #[cfg(not(windows))]
     {
@@ -50,7 +44,11 @@ fn backend(on_change: Box<dyn Fn(ClipEvent) + Send>) -> Box<dyn ClipboardBackend
                 Err(e) => eprintln!("启动剪贴板助手失败，改用本进程（部分复制内容可能读不到）: {e:#}"),
             }
         }
-        Box::new(crate::win::clipboard::Clipboard::spawn(Box::new(move |ev| on_change(ev))))
+        Box::new(rc_windows::clipboard::Clipboard::spawn(Box::new(move |ev| on_change(ev))))
+    }
+    #[cfg(target_os = "macos")]
+    if !crate::test_source() {
+        return Box::new(crate::mac::clipboard::Clipboard::spawn(on_change));
     }
     #[cfg(not(windows))]
     {
@@ -154,5 +152,18 @@ pub fn run(stream: TcpStream) {
                 }
             }
         }
+    }
+}
+
+#[cfg(windows)]
+impl ClipboardBackend for rc_windows::clipboard::Clipboard {
+    fn set(&self, data: ClipData) {
+        rc_windows::clipboard::Clipboard::set(self, data)
+    }
+    fn set_files(&self, paths: Vec<PathBuf>) {
+        rc_windows::clipboard::Clipboard::set_files(self, paths)
+    }
+    fn files(&self) -> Vec<PathBuf> {
+        rc_windows::clipboard::Clipboard::files(self)
     }
 }

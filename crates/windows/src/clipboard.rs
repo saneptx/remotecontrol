@@ -7,8 +7,7 @@
 //! 资源管理器复制文件、Office 复制内容时，数据放在 OLE 数据对象里，跨用户（本进程是 SYSTEM）
 //! 用传统 API 只能看到一个私有格式；这时改用 OleGetClipboard 读取。
 
-use crate::clip::{ClipEvent, ClipboardBackend};
-use rc_protocol::data::{ClipData, MAX_CLIPBOARD};
+use rc_protocol::data::{ClipData, ClipEvent, MAX_CLIPBOARD};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
@@ -39,14 +38,16 @@ impl Clipboard {
     }
 }
 
-impl ClipboardBackend for Clipboard {
-    fn set(&self, data: ClipData) {
+impl Clipboard {
+    pub fn set(&self, data: ClipData) {
         let _ = self.tx.send(Cmd::Set(data));
     }
-    fn set_files(&self, paths: Vec<PathBuf>) {
+    /// 把文件列表放进剪贴板，在资源管理器里 Ctrl+V 即可粘贴。
+    pub fn set_files(&self, paths: Vec<PathBuf>) {
         let _ = self.tx.send(Cmd::SetFiles(paths));
     }
-    fn files(&self) -> Vec<PathBuf> {
+    /// 当前剪贴板里的文件。
+    pub fn files(&self) -> Vec<PathBuf> {
         let (tx, rx) = mpsc::channel();
         if self.tx.send(Cmd::GetFiles(tx)).is_err() {
             return Vec::new();

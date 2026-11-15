@@ -170,15 +170,39 @@ pub fn approve_pairing(client: &str, peer: &str, code: &str) -> bool {
     }
     #[cfg(not(windows))]
     {
-        // 测试图像源：设置 RC_AUTO_ACCEPT=1 自动同意，否则在终端里确认。
+        // 测试用：设置 RC_AUTO_ACCEPT=1 自动同意
         if std::env::var("RC_AUTO_ACCEPT").is_ok_and(|v| v == "1") {
             println!("自动同意配对：{client}（{peer}），配对码 {code}");
             return true;
+        }
+        #[cfg(target_os = "macos")]
+        if !crate::test_source() {
+            return mac_dialog(client, peer, code);
         }
         println!("「{client}」（{peer}）请求配对，配对码 {code}。允许吗？[y/N]");
         let mut line = String::new();
         std::io::stdin().read_line(&mut line).is_ok() && line.trim().eq_ignore_ascii_case("y")
     }
+}
+
+/// macOS：系统对话框确认配对（被控端在后台运行，没有终端可用）。60 秒无人响应视为拒绝。
+#[cfg(target_os = "macos")]
+fn mac_dialog(client: &str, peer: &str, code: &str) -> bool {
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let text = format!(
+        "「{}」（{}）请求远程控制这台 Mac。\n\n配对码：{}\n请确认与控制端屏幕上显示的配对码一致。\n\n允许后，该设备以后可以直接连接，无需再次确认。",
+        esc(client),
+        esc(peer),
+        code
+    );
+    let script = format!(
+        "display dialog \"{text}\" with title \"RemoteControl 配对请求\" buttons {{\"拒绝\", \"允许\"}} default button \"拒绝\" with icon caution giving up after 60"
+    );
+    std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("允许"))
+        .unwrap_or(false)
 }
 
 /// 设备名只用于显示：去掉控制字符，限制长度。
