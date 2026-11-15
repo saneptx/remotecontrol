@@ -22,6 +22,9 @@ pub struct Connection {
     pub height: u32,
     pub fps: u32,
     pub host_name: String,
+    pub addr: SocketAddr,
+    /// 打开数据通道（剪贴板、文件）用的凭据
+    pub data_token: [u8; 16],
 }
 
 /// 握手过程中需要告知用户的事件。
@@ -109,7 +112,7 @@ fn handshake(addr: SocketAddr, mut on_event: impl FnMut(HandshakeEvent), pair_on
     let mac = proto::pair::client_mac(&key, &host_nonce, &client_nonce);
     proto::write_msg(&mut tcp, &ClientMsg::Auth { mac, udp_port: udp.local_addr()?.port() })?;
     match proto::read_msg(&mut tcp)? {
-        HostMsg::Welcome { width, height, fps, host_proof } => {
+        HostMsg::Welcome { width, height, fps, host_proof, data_token } => {
             if !proto::pair::ct_eq(&host_proof, &proto::pair::host_proof(&key, &host_nonce, &client_nonce)) {
                 bail!("被控端身份验证失败：对方不是配对时的那台机器（可能被冒充），已中止连接");
             }
@@ -119,7 +122,7 @@ fn handshake(addr: SocketAddr, mut on_event: impl FnMut(HandshakeEvent), pair_on
                 eprintln!("已与「{host_name}」配对，以后可直接连接");
             }
             tcp.set_read_timeout(None)?;
-            Ok(Some(Connection { tcp, udp, width, height, fps, host_name }))
+            Ok(Some(Connection { tcp, udp, width, height, fps, host_name, addr, data_token }))
         }
         HostMsg::Reject { reason } => bail!("被控端拒绝连接: {reason}"),
         other => bail!("握手失败: {other:?}"),

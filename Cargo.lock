@@ -2589,6 +2589,7 @@ name = "rc-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "clap",
  "libloading",
  "rc-protocol",
@@ -2606,6 +2607,7 @@ dependencies = [
  "bincode",
  "getrandom 0.2.17",
  "hmac",
+ "png 0.17.16",
  "reed-solomon-simd",
  "serde",
  "sha2",

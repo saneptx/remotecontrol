@@ -5,15 +5,18 @@
 //! - 视频通道：UDP，每帧切成 ≤ [`MAX_PAYLOAD`] 字节的分片，丢包时不重传，
 //!   由控制端请求关键帧恢复（局域网内重传的等待比重发一帧更贵）。
 
+pub mod data;
 pub mod discovery;
 pub mod hevc;
+pub mod image;
 pub mod pair;
+pub mod transfer;
 pub mod video;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const DEFAULT_PORT: u16 = 47800;
 /// 局域网发现使用的 UDP 端口。
 pub const DISCOVERY_PORT: u16 = 47801;
@@ -54,6 +57,8 @@ pub enum ClientMsg {
     PairKey { public_key: [u8; 32] },
     /// 收到 Challenge 但本机没有该被控端的配对信息（被删除或重装）：请求重新配对。
     RequestPairing,
+    /// 新连接的第一条消息：表示这是某个会话的数据通道（剪贴板、文件），`token` 来自 Welcome。
+    DataHello { token: [u8; 16] },
     /// `mac` 见 [`pair::client_mac`]；`udp_port` 为控制端接收视频的端口。
     Auth { mac: [u8; 32], udp_port: u16 },
     Input(InputEvent),
@@ -70,8 +75,8 @@ pub enum HostMsg {
     Challenge { host_id: DeviceId, host_name: String, nonce: [u8; 16] },
     /// 控制端未配对：附被控端的 X25519 临时公钥，等待控制端的 `PairKey`。
     PairRequired { host_id: DeviceId, host_name: String, public_key: [u8; 32] },
-    /// `host_proof` 见 [`pair::host_proof`]。
-    Welcome { width: u32, height: u32, fps: u32, host_proof: [u8; 32] },
+    /// `host_proof` 见 [`pair::host_proof`]；`data_token` 用于打开数据通道。
+    Welcome { width: u32, height: u32, fps: u32, host_proof: [u8; 32], data_token: [u8; 16] },
     Reject { reason: String },
     /// `t_us` 原样返回，`host_us` 为被控端时钟，用于估算两端时钟差。
     Pong { t_us: u64, host_us: u64 },

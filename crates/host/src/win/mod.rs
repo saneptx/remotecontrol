@@ -1,6 +1,8 @@
 //! Windows 被控端：DXGI Desktop Duplication 采集 → NVENC HEVC 4:4:4 编码，全程显存内零拷贝。
 
 mod capture;
+pub mod clipboard;
+pub mod cliphelper;
 mod desktop;
 pub mod dialog;
 pub mod input;

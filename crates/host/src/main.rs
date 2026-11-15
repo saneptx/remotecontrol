@@ -1,5 +1,6 @@
 //! 被控端：等待控制端连接，推送屏幕画面，注入键鼠输入。
 
+mod clip;
 mod source;
 mod trust;
 #[cfg(not(windows))]
@@ -15,7 +16,8 @@ use rc_protocol::{self as proto, video, ClientMsg, HostMsg};
 use source::{InputSink, VideoSource};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
@@ -42,6 +44,9 @@ enum Cmd {
     /// 由 Windows 服务管理器调用，请勿手动运行
     #[command(hide = true)]
     Service(Args),
+    /// 剪贴板助手（由被控端以登录用户身份启动），请勿手动运行
+    #[command(hide = true)]
+    ClipHelper,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -103,6 +108,8 @@ fn main() -> Result<()> {
         Some(Cmd::Status) => win::service::status(),
         #[cfg(windows)]
         Some(Cmd::Service(args)) => win::service::run(args),
+        #[cfg(windows)]
+        Some(Cmd::ClipHelper) => win::cliphelper::helper_main(),
         Some(Cmd::Devices) => list_devices(),
         Some(Cmd::Forget { query }) => {
             let store = trust::Store::open(None)?;
@@ -200,6 +207,13 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
         Err(e) => return Err(e.into()),
     };
+    // 数据通道：交给对应的会话
+    if let ClientMsg::DataHello { token } = hello {
+        if let Some(tx) = data_waiters().lock().unwrap().remove(&token) {
+            let _ = tx.send(tcp);
+        }
+        return Ok(false);
+    }
     let ClientMsg::Hello { version, device_id, device_name, client_nonce } = hello else {
         // 旧版本控制端的 Hello 格式不同，解析会落到这里
         let _ = proto::write_msg(&mut tcp, &HostMsg::Reject { reason: "控制端版本过旧，请更新".into() });
@@ -287,7 +301,24 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
     };
     let (width, height) = video_src.size();
     let host_proof = proto::pair::host_proof(&key, &nonce, &client_nonce);
-    proto::write_msg(&mut tcp, &HostMsg::Welcome { width, height, fps: video_src.fps(), host_proof })?;
+    // 数据通道（剪贴板、文件）：控制端拿 token 另开一条连接
+    let data_token = proto::random_nonce();
+    let (data_tx, data_rx) = mpsc::channel::<TcpStream>();
+    data_waiters().lock().unwrap().insert(data_token, data_tx);
+    let data_conn: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
+    {
+        let data_conn = data_conn.clone();
+        std::thread::spawn(move || {
+            let stream = data_rx.recv_timeout(Duration::from_secs(15));
+            data_waiters().lock().unwrap().remove(&data_token);
+            if let Ok(stream) = stream {
+                let _ = stream.set_read_timeout(None);
+                *data_conn.lock().unwrap() = stream.try_clone().ok();
+                clip::run(stream);
+            }
+        });
+    }
+    proto::write_msg(&mut tcp, &HostMsg::Welcome { width, height, fps: video_src.fps(), host_proof, data_token })?;
     // 会话期间保持显示器常亮
     #[cfg(windows)]
     let _awake = win::power::SessionAwake::new();
@@ -379,10 +410,19 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
         Ok(())
     })();
 
-    // 关闭 TCP 让读线程退出
+    // 关闭 TCP 让读线程退出；数据通道一并关闭
     let _ = writer.lock().unwrap().shutdown(std::net::Shutdown::Both);
+    if let Some(d) = data_conn.lock().unwrap().take() {
+        let _ = d.shutdown(std::net::Shutdown::Both);
+    }
     let _ = reader.join();
     result.map(|()| true)
+}
+
+/// 等待数据通道连接的会话：token → 交付通道。
+fn data_waiters() -> &'static Mutex<HashMap<[u8; 16], mpsc::Sender<TcpStream>>> {
+    static W: OnceLock<Mutex<HashMap<[u8; 16], mpsc::Sender<TcpStream>>>> = OnceLock::new();
+    W.get_or_init(Default::default)
 }
 
 /// 局域网发现应答：收到控制端的广播探测，就单播回复本机信息。

@@ -11,6 +11,8 @@ mod awdl;
 #[cfg(target_os = "macos")]
 mod config;
 #[cfg(target_os = "macos")]
+mod datalink;
+#[cfg(target_os = "macos")]
 mod display;
 #[cfg(target_os = "macos")]
 mod gui;
@@ -18,6 +20,8 @@ mod gui;
 mod keymap;
 #[cfg(target_os = "macos")]
 mod net;
+#[cfg(target_os = "macos")]
+mod pasteboard;
 
 #[cfg(target_os = "macos")]
 #[derive(clap::Parser, Debug)]
@@ -108,6 +112,12 @@ mod app {
         /// 始终按远端原始分辨率传输（默认按本机窗口的实际像素尺寸缩小编码，延迟更低）
         #[arg(long)]
         native: bool,
+        /// 连接后把这些文件 / 文件夹发送到远端“下载”（等同于拖进窗口）
+        #[arg(long = "send", value_name = "路径")]
+        send: Vec<std::path::PathBuf>,
+        /// 连接后取回远端剪贴板里的文件（等同于 ⌘⇧D）
+        #[arg(long, hide = true)]
+        fetch: bool,
     }
 
     enum UserEvent {
@@ -127,6 +137,10 @@ mod app {
         buttons_down: HashSet<u8>,
         /// 触控板像素滚动的小数累积（单位：1/120 格）。
         wheel_acc: (f64, f64),
+        data: Option<crate::datalink::DataLink>,
+        mods: winit::keyboard::ModifiersState,
+        /// 被本地快捷键吃掉的按键：抬起时也不发给远端
+        swallowed: HashSet<winit::keyboard::KeyCode>,
     }
 
     pub fn run(args: ViewArgs) -> Result<()> {
@@ -156,6 +170,9 @@ mod app {
             keys_down: HashSet::new(),
             buttons_down: HashSet::new(),
             wheel_acc: (0.0, 0.0),
+            data: None,
+            mods: Default::default(),
+            swallowed: HashSet::new(),
         };
         event_loop.run_app(&mut app)?;
         Ok(())
@@ -177,6 +194,33 @@ mod app {
 
             let control = net::Control::new(conn.tcp.try_clone()?);
             self.shared.alive.store(true, Ordering::Relaxed);
+            // 数据通道失败不影响远程画面，只是没有剪贴板和文件传输
+            match crate::datalink::DataLink::open(conn.addr, conn.data_token) {
+                Ok(link) => {
+                    if !self.args.send.is_empty() {
+                        let (l, paths) = (link.clone(), self.args.send.clone());
+                        std::thread::spawn(move || {
+                            l.send_paths(paths);
+                            eprintln!("{}", l.status.lock().unwrap().clone().unwrap_or_default());
+                        });
+                    }
+                    if self.args.fetch {
+                        let l = link.clone();
+                        std::thread::spawn(move || {
+                            // 等远端剪贴板里出现文件（最多 60 秒）
+                            for _ in 0..600 {
+                                if l.remote_files.lock().unwrap().is_some() {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                            l.fetch_remote_files();
+                        });
+                    }
+                    self.data = Some(link);
+                }
+                Err(e) => eprintln!("数据通道不可用（剪贴板与文件传输不可用）: {e:#}"),
+            }
             let proxy = self.proxy.clone();
             net::spawn_control_reader(conn.tcp, self.shared.clone(), move || {
                 let _ = proxy.send_event(UserEvent::Disconnected);
@@ -184,6 +228,7 @@ mod app {
             net::spawn_pinger(control.clone(), self.shared.clone());
             let (title_window, host, print_stats) = (window.clone(), self.host_name.clone(), self.args.stats);
             let shared = self.shared.clone();
+            let link = self.data.clone();
             net::spawn_video_receiver(conn.udp, sink, control.clone(), self.shared.clone(), move |s| {
                 let mut line = format!(
                     "{} fps · {:.0} Mbps · 延迟 {:.1} ms（被控端 {:.1} + 传输 {:.1}，最大 {:.1}）· RTT {:.1} ms",
@@ -203,6 +248,16 @@ mod app {
                 }
                 if s.awdl_active {
                     line += " · ⚠️ AWDL 开启（会造成延迟尖峰）";
+                }
+                if let Some(link) = &link {
+                    if let Some((names, bytes)) = link.remote_files.lock().unwrap().as_ref() {
+                        let first = names.first().cloned().unwrap_or_default();
+                        let more = if names.len() > 1 { format!(" 等 {} 项", names.len()) } else { String::new() };
+                        line = format!("远端复制了「{first}」{more}（{:.1} MB），按 ⌘⇧D 保存到本机 · {line}", *bytes as f64 / 1e6);
+                    }
+                    if let Some(st) = link.status.lock().unwrap().as_ref() {
+                        line = format!("{st} · {line}");
+                    }
                 }
                 if print_stats {
                     println!("{line}");
@@ -301,6 +356,9 @@ mod app {
             match event {
                 WindowEvent::CloseRequested => {
                     self.release_all();
+                    if let Some(d) = &self.data {
+                        d.close();
+                    }
                     self.shared.alive.store(false, Ordering::Relaxed);
                     event_loop.exit();
                 }
@@ -345,8 +403,28 @@ mod app {
                         self.send(InputEvent::Wheel { dx: clamp(ix), dy: clamp(iy) });
                     }
                 }
+                WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+                // 拖进窗口的文件发送到远端“下载”，并放进远端剪贴板
+                WindowEvent::DroppedFile(path) => {
+                    if let Some(d) = &self.data {
+                        d.drop_file(path);
+                    }
+                }
                 WindowEvent::KeyboardInput { event, .. } => {
                     let PhysicalKey::Code(code) = event.physical_key else { return };
+                    // ⌘⇧D：取回远端复制的文件（本地快捷键，不发给远端）
+                    if code == winit::keyboard::KeyCode::KeyD && self.mods.super_key() && self.mods.shift_key() {
+                        if event.state == ElementState::Pressed && !event.repeat {
+                            self.swallowed.insert(code);
+                            if let Some(d) = &self.data {
+                                d.fetch_remote_files();
+                            }
+                        }
+                        return;
+                    }
+                    if event.state == ElementState::Released && self.swallowed.remove(&code) {
+                        return;
+                    }
                     let Some((scancode, extended)) = keymap::to_scancode(code, self.args.cmd_as_ctrl) else { return };
                     let down = event.state == ElementState::Pressed;
                     if down {
