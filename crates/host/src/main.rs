@@ -1,6 +1,7 @@
 //! 被控端：等待控制端连接，推送屏幕画面，注入键鼠输入。
 
 mod source;
+mod trust;
 #[cfg(not(windows))]
 mod testsrc;
 #[cfg(windows)]
@@ -34,6 +35,10 @@ enum Cmd {
     Uninstall,
     /// 检查服务、端口、网络与防火墙状态，排查连不上的问题
     Status,
+    /// 列出已配对（可免确认直接连接）的控制端
+    Devices,
+    /// 删除已配对的控制端（按名称或标识前缀；`--all` 删除全部）
+    Forget { query: String },
     /// 由 Windows 服务管理器调用，请勿手动运行
     #[command(hide = true)]
     Service(Args),
@@ -44,9 +49,9 @@ pub struct Args {
     /// 监听端口（TCP 控制通道）
     #[arg(long, default_value_t = proto::DEFAULT_PORT)]
     pub port: u16,
-    /// 连接密码；不指定则随机生成（服务模式下首次安装时生成并保存）
-    #[arg(long, env = "RC_PASSWORD")]
-    pub password: Option<String>,
+    /// 本机在控制端设备列表里显示的名称（默认为计算机名）
+    #[arg(long)]
+    pub name: Option<String>,
     /// 目标码率（Mbps）。4:4:4 下 1080p 建议 50+，4K 建议 100+
     #[arg(long, default_value_t = 80)]
     pub bitrate: u32,
@@ -68,12 +73,6 @@ pub struct Args {
 pub fn now_us() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_micros() as u64
-}
-
-/// 去掉易混淆字符的 8 位随机口令。
-pub fn generate_password() -> String {
-    const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
-    proto::random_nonce()[..8].iter().map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char).collect()
 }
 
 fn validate(args: &Args) -> Result<()> {
@@ -104,26 +103,50 @@ fn main() -> Result<()> {
         Some(Cmd::Status) => win::service::status(),
         #[cfg(windows)]
         Some(Cmd::Service(args)) => win::service::run(args),
+        Some(Cmd::Devices) => list_devices(),
+        Some(Cmd::Forget { query }) => {
+            let store = trust::Store::open(None)?;
+            let removed = store.forget(&query)?;
+            if removed.is_empty() {
+                println!("没有找到匹配「{query}」的设备。运行 rc-host devices 查看列表。");
+            }
+            for d in removed {
+                println!("已删除：{}（{}）", d.name, &d.id[..8]);
+            }
+            Ok(())
+        }
         #[cfg(not(windows))]
         Some(_) => bail!("系统服务只支持 Windows"),
     }
+}
+
+pub fn list_devices() -> Result<()> {
+    let store = trust::Store::open(None)?;
+    let list = store.list();
+    println!("本机：{}（{}）", store.host_name(), &proto::hex(&store.host_id())[..8]);
+    println!("配置：{}", store.path().display());
+    if list.is_empty() {
+        println!("还没有已配对的控制端。");
+    }
+    for d in list {
+        println!("  {}  {}", &d.id[..8], d.name);
+    }
+    Ok(())
 }
 
 fn run_host(args: Args) -> Result<()> {
     now_us();
     #[cfg(windows)]
     win::power::init(!args.allow_sleep);
-    let generated = args.password.is_none();
-    let password = args.password.clone().unwrap_or_else(generate_password);
+    let store = Arc::new(trust::Store::open(args.name.clone())?);
 
     let listener = TcpListener::bind(("0.0.0.0", args.port)).with_context(|| format!("监听端口 {} 失败（是否已有被控端或系统服务在运行？）", args.port))?;
-    if generated {
-        println!("被控端已启动，端口 {}，连接密码: {}", args.port, password);
-    } else {
-        println!("被控端已启动，端口 {}（使用已配置的密码）", args.port);
-    }
-    println!("等待控制端连接…");
+    spawn_discovery(store.clone(), args.port);
+    println!("被控端「{}」已启动，端口 {}，配置 {}", store.host_name(), args.port, store.path().display());
+    println!("等待控制端连接…（新设备首次连接时会在本机弹窗确认）");
 
+    // 每个连接一个线程；同一时间只允许一个控制端，其余的收到“正在被控制”的提示。
+    let active: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
@@ -132,18 +155,41 @@ fn run_host(args: Args) -> Result<()> {
                 continue;
             }
         };
-        let peer = stream.peer_addr().ok();
-        match session(stream, &args, &password) {
-            Ok(true) => println!("会话结束 {peer:?}"),
-            Ok(false) => {} // 端口探测
-            Err(e) => eprintln!("会话出错 {peer:?}: {e:#}"),
-        }
+        let (args, store, active) = (args.clone(), store.clone(), active.clone());
+        std::thread::spawn(move || {
+            let peer = stream.peer_addr().ok();
+            match session(stream, &args, &store, &active) {
+                Ok(true) => println!("会话结束 {peer:?}"),
+                Ok(false) => {} // 端口探测、仅配对
+                Err(e) => eprintln!("会话出错 {peer:?}: {e:#}"),
+            }
+        });
     }
     Ok(())
 }
 
+/// 占用“当前控制端”名额；析构时释放。
+struct ActiveSlot(Arc<Mutex<Option<String>>>);
+
+impl ActiveSlot {
+    fn claim(active: &Arc<Mutex<Option<String>>>, name: &str) -> Result<Self, String> {
+        let mut cur = active.lock().unwrap();
+        if let Some(other) = cur.as_ref() {
+            return Err(other.clone());
+        }
+        *cur = Some(name.to_string());
+        Ok(Self(active.clone()))
+    }
+}
+
+impl Drop for ActiveSlot {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = None;
+    }
+}
+
 /// 返回 `Ok(false)` 表示对方只是连上就断开（端口探测，例如 `rc-host status`），不记日志。
-fn session(mut tcp: TcpStream, args: &Args, password: &str) -> Result<bool> {
+fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<Mutex<Option<String>>>) -> Result<bool> {
     tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
     let peer = tcp.peer_addr()?;
@@ -154,24 +200,82 @@ fn session(mut tcp: TcpStream, args: &Args, password: &str) -> Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
         Err(e) => return Err(e.into()),
     };
-    let ClientMsg::Hello { version, client_nonce } = hello else {
+    let ClientMsg::Hello { version, device_id, device_name, client_nonce } = hello else {
+        // 旧版本控制端的 Hello 格式不同，解析会落到这里
+        let _ = proto::write_msg(&mut tcp, &HostMsg::Reject { reason: "控制端版本过旧，请更新".into() });
         bail!("握手失败：期望 Hello");
     };
     if version != proto::PROTOCOL_VERSION {
-        proto::write_msg(&mut tcp, &HostMsg::Reject { reason: format!("协议版本不匹配（被控端 {}）", proto::PROTOCOL_VERSION) })?;
+        proto::write_msg(&mut tcp, &HostMsg::Reject { reason: format!("协议版本不匹配（被控端 {}，控制端 {version}），请把两端更新到同一版本", proto::PROTOCOL_VERSION) })?;
         bail!("协议版本不匹配: {version}");
     }
-    let nonce = proto::random_nonce();
-    proto::write_msg(&mut tcp, &HostMsg::Challenge { nonce })?;
-    let ClientMsg::Auth { mac, udp_port } = proto::read_msg(&mut tcp)? else {
+    let device_name = trust::sanitize_name(&device_name);
+    let (host_id, host_name) = (store.host_id(), store.host_name().to_string());
+    let _slot = match ActiveSlot::claim(active, &device_name) {
+        Ok(s) => s,
+        Err(other) => {
+            let _ = proto::write_msg(&mut tcp, &HostMsg::Reject { reason: format!("「{other}」正在控制「{host_name}」，请稍后再试") });
+            return Ok(false);
+        }
+    };
+
+    // ---- 未配对：交换临时公钥，弹窗确认 ----
+    let pair = |tcp: &mut TcpStream| -> Result<proto::pair::Key> {
+        let eph = proto::pair::Ephemeral::generate();
+        proto::write_msg(tcp, &HostMsg::PairRequired { host_id, host_name: host_name.clone(), public_key: eph.public })?;
+        let ClientMsg::PairKey { public_key } = proto::read_msg(tcp)? else {
+            bail!("配对失败：期望 PairKey");
+        };
+        let Some(key) = eph.derive(&public_key, &host_id, &device_id) else {
+            bail!("配对失败：对方公钥无效");
+        };
+        let code = proto::pair::pair_code(&key);
+        println!("配对请求：{device_name}（{}），配对码 {code}", peer.ip());
+        if !trust::approve_pairing(&device_name, &peer.ip().to_string(), &code) {
+            let _ = proto::write_msg(tcp, &HostMsg::Reject { reason: format!("「{host_name}」拒绝了配对请求（或 60 秒内无人确认）") });
+            bail!("配对被拒绝：{device_name}");
+        }
+        store.add(&device_id, &device_name, &key)?;
+        println!("已与「{device_name}」配对");
+        Ok(key)
+    };
+    let mut key = match store.key_for(&device_id) {
+        Some(k) => k,
+        None => pair(&mut tcp)?,
+    };
+
+    // ---- 双向认证 ----
+    let mut nonce = proto::random_nonce();
+    proto::write_msg(&mut tcp, &HostMsg::Challenge { host_id, host_name: host_name.clone(), nonce })?;
+    tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut auth = match proto::read_msg::<ClientMsg>(&mut tcp) {
+        Ok(m) => m,
+        // 控制端界面只做配对、随后断开（真正的画面连接紧接着另开）
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    if auth == ClientMsg::RequestPairing {
+        // 本机记得对方，但对方丢了配对信息（重装、删除了设备）：重新配对，仍需本机用户确认
+        tcp.set_read_timeout(Some(Duration::from_secs(90)))?;
+        key = pair(&mut tcp)?;
+        nonce = proto::random_nonce();
+        proto::write_msg(&mut tcp, &HostMsg::Challenge { host_id, host_name: host_name.clone(), nonce })?;
+        tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
+        auth = match proto::read_msg::<ClientMsg>(&mut tcp) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+    }
+    let ClientMsg::Auth { mac, udp_port } = auth else {
         bail!("握手失败：期望 Auth");
     };
-    if !proto::verify_mac(password, &nonce, &client_nonce, &mac) {
+    if !proto::pair::ct_eq(&mac, &proto::pair::client_mac(&key, &nonce, &client_nonce)) {
         std::thread::sleep(Duration::from_secs(1)); // 限制暴力尝试速度
-        proto::write_msg(&mut tcp, &HostMsg::Reject { reason: "密码错误".into() })?;
-        bail!("密码错误");
+        proto::write_msg(&mut tcp, &HostMsg::Reject { reason: "认证失败：配对信息不一致，请在控制端删除该设备后重新配对".into() })?;
+        bail!("认证失败：{device_name}");
     }
-    println!("控制端已连接: {peer}");
+    println!("控制端已连接: {device_name}（{peer}）");
 
     // ---- 打开采集/编码 ----
     let (mut video_src, mut input) = match open_platform(args) {
@@ -182,7 +286,8 @@ fn session(mut tcp: TcpStream, args: &Args, password: &str) -> Result<bool> {
         }
     };
     let (width, height) = video_src.size();
-    proto::write_msg(&mut tcp, &HostMsg::Welcome { width, height, fps: video_src.fps() })?;
+    let host_proof = proto::pair::host_proof(&key, &nonce, &client_nonce);
+    proto::write_msg(&mut tcp, &HostMsg::Welcome { width, height, fps: video_src.fps(), host_proof })?;
     // 会话期间保持显示器常亮
     #[cfg(windows)]
     let _awake = win::power::SessionAwake::new();
@@ -278,6 +383,35 @@ fn session(mut tcp: TcpStream, args: &Args, password: &str) -> Result<bool> {
     let _ = writer.lock().unwrap().shutdown(std::net::Shutdown::Both);
     let _ = reader.join();
     result.map(|()| true)
+}
+
+/// 局域网发现应答：收到控制端的广播探测，就单播回复本机信息。
+fn spawn_discovery(store: Arc<trust::Store>, port: u16) {
+    let os = if cfg!(windows) { "windows" } else { "macos" };
+    std::thread::spawn(move || {
+        let bind = || -> std::io::Result<UdpSocket> {
+            let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+            sock.set_reuse_address(true)?;
+            sock.set_broadcast(true)?;
+            sock.bind(&SocketAddr::from(([0, 0, 0, 0], proto::DISCOVERY_PORT)).into())?;
+            Ok(sock.into())
+        };
+        let sock = match bind() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("局域网发现不可用（UDP {} 绑定失败）: {e}", proto::DISCOVERY_PORT);
+                return;
+            }
+        };
+        let mut buf = [0u8; 512];
+        loop {
+            let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
+            let Some(probe) = proto::discovery::decode_probe(&buf[..n]) else { continue };
+            let paired = store.key_for(&probe.device_id).is_some();
+            let reply = proto::discovery::Announce::new(store.host_id(), store.host_name().to_string(), os, port, paired);
+            let _ = sock.send_to(&proto::discovery::encode(&reply), from);
+        }
+    });
 }
 
 /// 发送一个 UDP 包。发送缓冲区满时短暂退避重试；其余错误（例如对端端口暂不可达）忽略，

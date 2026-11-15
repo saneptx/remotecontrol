@@ -9,6 +9,8 @@ anyhow.workspace = true
 clap.workspace = true
 socket2.workspace = true
 rc-protocol.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
 libloading = "0.8"

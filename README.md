@@ -9,7 +9,8 @@
 | 传输 | 视频走 UDP（≤1400 字节分片 + Reed-Solomon 前向纠错，零星丢包直接还原，不重传）；控制走 TCP_NODELAY |
 | 解码显示 | VideoToolbox 硬解 + AVSampleBufferDisplayLayer，解完立即上屏，不缓冲 |
 | 输入 | 绝对坐标鼠标、滚轮、扫描码键盘，经 SendInput 注入 |
-| 认证 | 密码 + HMAC-SHA256 挑战应答（密码不在网络上明文传输） |
+| 发现 | UDP 广播，打开控制端即可看到局域网里所有被控端 |
+| 认证 | 首次连接配对（X25519 交换密钥 + 双方核对 6 位配对码 + 被控端弹窗确认），之后免密；每次连接双向挑战应答，防止冒充被控端 |
 
 ## 目录
 
@@ -26,7 +27,7 @@
 
 `rc-host.exe` 是单个文件，不需要安装任何运行库（需要 NVIDIA 显卡与较新驱动）。两种用法：
 
-- **临时使用**：双击 `rc-host.exe`，窗口里显示连接密码。首次运行时防火墙会弹窗，选择允许“专用网络”。
+- **临时使用**：双击 `rc-host.exe`。首次运行时防火墙会弹窗，选择允许“专用网络”。
   这种方式看不到也操作不了锁屏和 UAC 弹窗。
 - **安装为系统服务（推荐）**：双击 `install-service.cmd`（会请求管理员权限）。之后开机自动运行，
   锁屏、登录界面、UAC 弹窗和以管理员身份运行的程序都能正常显示和操作。详见下文。
@@ -34,19 +35,20 @@
 ## 系统服务模式
 
 ```
-rc-host.exe install [--password 密码] [--port 47800] [--bitrate 80] [--fps 60] [--fec 20]
+rc-host.exe install [--name 书房电脑] [--port 47800] [--bitrate 80] [--fps 60] [--fec 20]
 rc-host.exe uninstall
+rc-host.exe devices            # 列出已配对的控制端
+rc-host.exe forget <名称>       # 删除已配对的控制端（--all 删除全部）
 ```
 
 需要在管理员终端里执行（或直接双击 `install-service.cmd` / `uninstall-service.cmd`）。`install` 会：
 
 1. 把程序复制到 `C:\Program Files\RemoteControl\`；
-2. 保存连接密码到 `C:\ProgramData\RemoteControl\password.txt`（仅 SYSTEM 和管理员可读）。
-   不指定 `--password` 时首次安装随机生成，之后重新安装会沿用原密码；
+2. 创建 `C:\ProgramData\RemoteControl\`（仅 SYSTEM 和管理员可读），保存本机标识与已配对设备；
 3. 添加防火墙入站规则（专用 / 域网络）；
 4. 注册并启动开机自启的系统服务，崩溃后自动重启。
 
-修改密码或参数：带上新参数重新执行 `install`。升级版本：用新版 exe 重新执行 `install`。
+修改参数：带上新参数重新执行 `install`。升级版本：用新版 exe 重新执行 `install`（配对信息保留）。
 
 运行日志在 `C:\ProgramData\RemoteControl\host.log`（需要管理员权限查看）。
 
@@ -61,29 +63,45 @@ SYSTEM 身份可以进入锁屏 / UAC 所在的安全桌面，工作进程在桌
 - 不支持发送 Ctrl+Alt+Del（Windows 不允许模拟）。如果锁屏要求先按 Ctrl+Alt+Del，请在本机组策略中关闭该要求。
 - 如果 Windows 把当前网络识别为“公用网络”，防火墙规则不生效，请把网络改为“专用网络”。
 
-## 构建与运行
+## 使用方法
+
+1. Windows 上安装被控端（见上文“系统服务模式”）。
+2. Mac 上打开 `RemoteControl.app`（`packaging/macos/make-app.sh --install` 生成并安装到“应用程序”）。
+   首次打开时 macOS 会询问是否允许访问本地网络，请选择“允许”。
+3. 界面会自动列出局域网里的被控端，点“连接”。
+4. **首次连接需要配对**：Mac 上显示一个 6 位配对码，Windows 上同时弹出确认框显示同一个配对码，
+   核对一致后在 Windows 上点“是”。之后这台 Mac 可以直接连接，无需任何确认或密码。
+   不一致说明可能有人在中间篡改，请点“否”。
+
+界面里的设置：
+
+- **Command 键当作 Ctrl**：⌘C / ⌘V 直接对应 Windows 的复制粘贴（默认开启）
+- **按原始分辨率传输**：默认按窗口的实际像素尺寸缩小编码（延迟更低、显示效果相同）
+- **远程期间自动关闭 AWDL**：减少 Wi-Fi 延迟尖峰，首次开启需要输入管理员密码（见下文）
+
+### 命令行
+
+```
+rc-client                       # 打开图形界面
+rc-client scan                  # 扫描局域网里的被控端
+rc-client view 192.168.1.20     # 直接打开远程画面（未配对时在终端显示配对码）
+    [--cmd-as-ctrl] [--native] [--stats]
+rc-client hosts / forget <名称>  # 查看 / 删除已配对的被控端
+```
+
+### 从源码构建
 
 被控端（Windows，需要 NVIDIA GTX 10 系及以上显卡、较新驱动、Rust MSVC 工具链）：
 
 ```
 cargo build --release -p rc-host
-target\release\rc-host.exe --bitrate 80 --fps 60
 ```
-
-启动后会打印连接密码（也可用 `--password` 或环境变量 `RC_PASSWORD` 固定）。
 
 控制端（macOS）：
 
 ```
-cargo build --release -p rc-client
-target/release/rc-client 192.168.1.20 -p <密码>
+packaging/macos/make-app.sh            # 生成 target/RemoteControl.app
 ```
-
-- `--cmd-as-ctrl`：把 Command 当作 Ctrl 发送（默认当作 Win 键）
-- `--stats`：每秒在终端打印帧率 / 码率 / 延迟
-- `--native`：始终按远端原始分辨率传输。默认情况下，被控端会按本机窗口的实际像素尺寸缩小后再编码
-  （例如 4K 屏幕在 2560 像素宽的窗口里按 2560×1440 编码）：最终显示效果相同，编码耗时和带宽都更低。
-  调整窗口大小或切换全屏后会自动跟随。
 
 被控端常用参数：
 
@@ -105,8 +123,9 @@ target/release/rc-client 192.168.1.20 -p <密码>
 - **两端尽量都走有线**。Wi-Fi 是延迟抖动和丢包的主要来源；Mac 可用 USB-C 转网口。
 - **2.4 GHz Wi-Fi 带宽不够**，Mac 和 Windows 都要连 5 GHz（或 6 GHz）网络。
 - Mac 用 Wi-Fi 时，AirDrop / 接力 / 通用控制使用的 AWDL 会周期性切换信道，造成几十到上百毫秒的停顿
-  （窗口标题会提示“AWDL 开启”）。macOS 会自动把它重新打开，推荐安装守护脚本，只在远程控制期间压住它：
-  `sudo packaging/macos/awdl-guard.sh install`（卸载：`sudo packaging/macos/awdl-guard.sh uninstall`）。
+  （窗口标题会提示“AWDL 开启”）。macOS 会自动把它重新打开，推荐在界面里勾选“远程期间自动关闭 AWDL”：
+  它会安装一个后台守护，只在远程画面打开期间压住 AWDL，其余时间隔空投送等功能照常可用。
+  （等价的命令行：`sudo packaging/macos/awdl-guard.sh install` / `uninstall`）
 - 不开串流时先 `ping` 一下被控端：如果 RTT 本身就忽高忽低，问题在网络，不在本程序。
 
 没有 Windows 机器时，可在 macOS 上直接运行 `rc-host`（需要带 libx265 的 ffmpeg），
@@ -119,5 +138,5 @@ target/release/rc-client 192.168.1.20 -p <密码>
 - 只采集主显示器；混合显卡笔记本（显示器接在核显上）暂不支持。
 - 直接双击运行时看不到锁屏界面与 UAC 弹窗（窗口标题会提示），请安装为系统服务。
 - macOS 的系统级快捷键（Cmd+Tab、Cmd+Space、Mission Control 等）会被本机截获，发不到远端。
-- 视频流未加密，仅适用于可信局域网。
+- 视频与键鼠数据未加密（配对密钥不在网络上传输），仅适用于可信局域网。
 - 无音频、剪贴板、文件传输。

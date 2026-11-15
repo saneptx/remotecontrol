@@ -9,8 +9,13 @@ anyhow.workspace = true
 clap.workspace = true
 socket2.workspace = true
 rc-protocol.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+if-addrs = "0.15"
+png = "0.17"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 winit = "0.30"
 objc2 = "0.6"
 objc2-foundation = "0.3"
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "system_fonts"] }

@@ -2,6 +2,7 @@
 
 mod capture;
 mod desktop;
+pub mod dialog;
 pub mod input;
 mod nvenc;
 pub mod power;

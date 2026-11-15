@@ -3,7 +3,7 @@
 #
 # AWDL 会让 Wi-Fi 网卡周期性跳到其它信道，造成几十到上百毫秒的停顿，是 Wi-Fi 下
 # 远程画面延迟尖峰的主要来源；macOS 会在附近有苹果设备时自动重新打开它。
-# 本脚本安装一个后台守护：只要 rc-client 在运行，就保持 awdl0 关闭；rc-client 退出后
+# 本脚本安装一个后台守护：只要有远程画面窗口（rc-client view）在运行，就保持 awdl0 关闭；退出后
 # 不再干预（系统会按需重新打开，AirDrop 等功能照常可用）。
 #
 # 用法：
@@ -29,9 +29,9 @@ install)
     mkdir -p "$(dirname "$BIN")"
     cat > "$BIN" <<'GUARD'
 #!/bin/bash
-# 每秒检查一次：rc-client 在运行且 awdl0 处于开启状态时把它关掉。
+# 每秒检查一次：有远程画面窗口在运行且 awdl0 处于开启状态时把它关掉。
 while true; do
-    if pgrep -xq rc-client && ifconfig awdl0 2>/dev/null | head -1 | grep -q "<UP"; then
+    if pgrep -qf "rc-client view" && ifconfig awdl0 2>/dev/null | head -1 | grep -q "<UP"; then
         ifconfig awdl0 down
     fi
     sleep 1

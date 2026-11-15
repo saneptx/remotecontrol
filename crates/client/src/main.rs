@@ -7,22 +7,81 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
+mod awdl;
+#[cfg(target_os = "macos")]
+mod config;
+#[cfg(target_os = "macos")]
 mod display;
+#[cfg(target_os = "macos")]
+mod gui;
 #[cfg(target_os = "macos")]
 mod keymap;
 #[cfg(target_os = "macos")]
 mod net;
 
 #[cfg(target_os = "macos")]
+#[derive(clap::Parser, Debug)]
+#[command(about = "局域网远程控制 - 控制端（不带参数运行时打开图形界面）")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(clap::Subcommand, Debug)]
+enum Cmd {
+    /// 连接被控端并显示远程画面
+    View(app::ViewArgs),
+    /// 扫描局域网里的被控端
+    Scan,
+    /// 列出已配对的被控端
+    Hosts,
+    /// 删除已配对的被控端（按标识前缀或名称）
+    Forget { query: String },
+}
+
+#[cfg(target_os = "macos")]
 fn main() -> anyhow::Result<()> {
-    app::run()
+    use clap::Parser;
+    match Cli::parse().cmd {
+        None => gui::run(),
+        Some(Cmd::View(args)) => app::run(args),
+        Some(Cmd::Scan) => {
+            let found = net::discover(std::time::Duration::from_millis(800))?;
+            if found.is_empty() {
+                println!("没有发现被控端（确认对方已运行 rc-host，且在同一局域网）");
+            }
+            for d in found {
+                let paired = if d.paired { "已配对" } else { "未配对" };
+                println!("{}  {}  {}  {}", d.addr, d.name, d.os, paired);
+            }
+            Ok(())
+        }
+        Some(Cmd::Hosts) => {
+            for h in config::known_hosts() {
+                println!("{}  {}  {}", &h.id[..8], h.name, h.last_addr.unwrap_or_default());
+            }
+            Ok(())
+        }
+        Some(Cmd::Forget { query }) => {
+            let hosts = config::known_hosts();
+            let matched: Vec<_> = hosts.iter().filter(|h| h.name == query || (query.len() >= 4 && h.id.starts_with(&query))).collect();
+            if matched.is_empty() {
+                println!("没有匹配「{query}」的被控端");
+            }
+            for h in matched {
+                config::forget(&h.id)?;
+                println!("已删除：{}", h.name);
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
 mod app {
     use crate::{display::VideoSink, keymap, net};
     use anyhow::{Context, Result};
-    use clap::Parser;
     use rc_protocol::{ClientMsg, InputEvent};
     use std::collections::HashSet;
     use std::sync::atomic::Ordering;
@@ -36,14 +95,10 @@ mod app {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::{Window, WindowId};
 
-    #[derive(Parser, Debug)]
-    #[command(about = "局域网远程控制 - 控制端")]
-    struct Args {
+    #[derive(clap::Args, Debug)]
+    pub struct ViewArgs {
         /// 被控端地址，如 192.168.1.20 或 192.168.1.20:47800
         host: String,
-        /// 连接密码（被控端启动时显示）
-        #[arg(long, short, env = "RC_PASSWORD")]
-        password: String,
         /// 把 Command 键当作 Ctrl 发送（默认当作 Win 键）
         #[arg(long)]
         cmd_as_ctrl: bool,
@@ -60,7 +115,8 @@ mod app {
     }
 
     struct App {
-        args: Args,
+        args: ViewArgs,
+        host_name: String,
         conn: Option<net::Connection>,
         proxy: winit::event_loop::EventLoopProxy<UserEvent>,
         window: Option<Arc<Window>>,
@@ -73,12 +129,16 @@ mod app {
         wheel_acc: (f64, f64),
     }
 
-    pub fn run() -> Result<()> {
-        let args = Args::parse();
+    pub fn run(args: ViewArgs) -> Result<()> {
         // 告诉系统这是延迟敏感的前台任务：不做 App Nap、不合并定时器。
         let _activity = begin_latency_critical_activity();
-        let conn = net::connect(&args.host, &args.password)?;
-        println!("已连接，远端画面 {}x{} @ {}fps", conn.width, conn.height, conn.fps);
+        let addr = net::parse_addr(&args.host)?;
+        let conn = net::connect(addr, |ev| match ev {
+            net::HandshakeEvent::PairCode { host_name, code } => {
+                eprintln!("首次连接「{host_name}」需要配对：请在对方屏幕上确认配对码 {code} 并点“是”");
+            }
+        })?;
+        println!("已连接「{}」，远端画面 {}x{} @ {}fps", conn.host_name, conn.width, conn.height, conn.fps);
 
         let event_loop = EventLoop::<UserEvent>::with_user_event()
             // 不要默认菜单：否则 Cmd+Q / Cmd+W / Cmd+H 会被本地菜单吃掉，发不到远端。
@@ -86,6 +146,7 @@ mod app {
             .build()?;
         let mut app = App {
             video_size: (conn.width, conn.height),
+            host_name: conn.host_name.clone(),
             args,
             conn: Some(conn),
             proxy: event_loop.create_proxy(),
@@ -106,7 +167,7 @@ mod app {
             let (vw, vh) = self.video_size;
             // 初始窗口：逻辑宽 1280，保持远端画面比例。
             let size = LogicalSize::new(1280.0, 1280.0 * vh as f64 / vw as f64);
-            let attrs = Window::default_attributes().with_title(format!("远程控制 - {}", self.args.host)).with_inner_size(size);
+            let attrs = Window::default_attributes().with_title(format!("远程控制 - {}", self.host_name)).with_inner_size(size);
             let window = Arc::new(event_loop.create_window(attrs)?);
 
             let RawWindowHandle::AppKit(handle) = window.window_handle()?.as_raw() else {
@@ -121,7 +182,7 @@ mod app {
                 let _ = proxy.send_event(UserEvent::Disconnected);
             });
             net::spawn_pinger(control.clone(), self.shared.clone());
-            let (title_window, host, print_stats) = (window.clone(), self.args.host.clone(), self.args.stats);
+            let (title_window, host, print_stats) = (window.clone(), self.host_name.clone(), self.args.stats);
             let shared = self.shared.clone();
             net::spawn_video_receiver(conn.udp, sink, control.clone(), self.shared.clone(), move |s| {
                 let mut line = format!(

@@ -1,25 +1,60 @@
 //! 局域网远程控制协议。
 //!
-//! - 控制通道：TCP（NODELAY），长度前缀 + bincode。握手、输入事件、关键帧请求、心跳。
+//! - 控制通道：TCP（NODELAY），长度前缀 + bincode。握手与配对、输入事件、关键帧请求、心跳。
+//! - 发现：UDP 广播，见 [`discovery`]。
 //! - 视频通道：UDP，每帧切成 ≤ [`MAX_PAYLOAD`] 字节的分片，丢包时不重传，
 //!   由控制端请求关键帧恢复（局域网内重传的等待比重发一帧更贵）。
 
+pub mod discovery;
 pub mod hevc;
+pub mod pair;
 pub mod video;
 
-use hmac::{Hmac, Mac};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sha2::Sha256;
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const DEFAULT_PORT: u16 = 47800;
+/// 局域网发现使用的 UDP 端口。
+pub const DISCOVERY_PORT: u16 = 47801;
 const MAX_MSG_LEN: u32 = 64 * 1024;
 
+/// 设备的持久随机标识（首次运行时生成）。
+pub type DeviceId = [u8; 16];
+
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn parse_hex16(s: &str) -> Option<[u8; 16]> {
+    if s.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// 握手流程：
+///
+/// ```text
+/// 控制端 Hello ─────────────────────────▶ 被控端
+///        ◀── Challenge（已配对）  或  PairRequired（未配对，附被控端临时公钥）
+/// 未配对： PairKey（控制端临时公钥）──▶   被控端弹窗确认（两边显示相同的 6 位配对码）
+///        ◀── Challenge（确认后）  或  Reject
+/// Auth（用配对密钥计算的 MAC）────────▶
+///        ◀── Welcome（附被控端对配对密钥的证明，防止被冒充）
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ClientMsg {
-    Hello { version: u32, client_nonce: [u8; 16] },
-    /// `mac` = HMAC-SHA256(password, host_nonce || client_nonce)；`udp_port` 为控制端接收视频的端口。
+    Hello { version: u32, device_id: DeviceId, device_name: String, client_nonce: [u8; 16] },
+    /// 配对时控制端的 X25519 临时公钥。
+    PairKey { public_key: [u8; 32] },
+    /// 收到 Challenge 但本机没有该被控端的配对信息（被删除或重装）：请求重新配对。
+    RequestPairing,
+    /// `mac` 见 [`pair::client_mac`]；`udp_port` 为控制端接收视频的端口。
     Auth { mac: [u8; 32], udp_port: u16 },
     Input(InputEvent),
     RequestKeyframe,
@@ -31,8 +66,12 @@ pub enum ClientMsg {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum HostMsg {
-    Challenge { nonce: [u8; 16] },
-    Welcome { width: u32, height: u32, fps: u32 },
+    /// 控制端已配对：用配对密钥回答挑战。
+    Challenge { host_id: DeviceId, host_name: String, nonce: [u8; 16] },
+    /// 控制端未配对：附被控端的 X25519 临时公钥，等待控制端的 `PairKey`。
+    PairRequired { host_id: DeviceId, host_name: String, public_key: [u8; 32] },
+    /// `host_proof` 见 [`pair::host_proof`]。
+    Welcome { width: u32, height: u32, fps: u32, host_proof: [u8; 32] },
     Reject { reason: String },
     /// `t_us` 原样返回，`host_us` 为被控端时钟，用于估算两端时钟差。
     Pong { t_us: u64, host_us: u64 },
@@ -82,20 +121,10 @@ pub fn random_nonce() -> [u8; 16] {
     n
 }
 
-fn mac_for(password: &str, host_nonce: &[u8; 16], client_nonce: &[u8; 16]) -> Hmac<Sha256> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(password.as_bytes()).expect("hmac key");
-    mac.update(host_nonce);
-    mac.update(client_nonce);
-    mac
-}
-
-pub fn auth_mac(password: &str, host_nonce: &[u8; 16], client_nonce: &[u8; 16]) -> [u8; 32] {
-    mac_for(password, host_nonce, client_nonce).finalize().into_bytes().into()
-}
-
-/// 常数时间校验。
-pub fn verify_mac(password: &str, host_nonce: &[u8; 16], client_nonce: &[u8; 16], mac: &[u8; 32]) -> bool {
-    mac_for(password, host_nonce, client_nonce).verify_slice(mac).is_ok()
+pub fn random_32() -> [u8; 32] {
+    let mut n = [0u8; 32];
+    getrandom::getrandom(&mut n).expect("os rng");
+    n
 }
 
 #[cfg(test)]
@@ -122,11 +151,10 @@ mod tests {
     }
 
     #[test]
-    fn auth() {
-        let (h, c) = ([1u8; 16], [2u8; 16]);
-        let mac = auth_mac("secret", &h, &c);
-        assert!(verify_mac("secret", &h, &c, &mac));
-        assert!(!verify_mac("wrong", &h, &c, &mac));
-        assert!(!verify_mac("secret", &c, &h, &mac));
+    fn hex_roundtrip() {
+        let id = random_nonce();
+        assert_eq!(parse_hex16(&hex(&id)), Some(id));
+        assert_eq!(parse_hex16("zz"), None);
+        assert_eq!(parse_hex16(&"g".repeat(32)), None);
     }
 }

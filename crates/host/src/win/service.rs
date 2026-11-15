@@ -54,21 +54,20 @@ fn program_dir() -> PathBuf {
     PathBuf::from(std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into())).join("RemoteControl")
 }
 
-fn data_dir() -> PathBuf {
+pub fn data_dir() -> PathBuf {
     PathBuf::from(std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into())).join("RemoteControl")
-}
-
-fn password_file() -> PathBuf {
-    data_dir().join("password.txt")
 }
 
 pub fn log_file() -> PathBuf {
     data_dir().join("host.log")
 }
 
-/// 传给工作进程的参数（不含密码，密码走环境变量，避免出现在进程命令行里）。
+/// 传给工作进程的参数。
 fn worker_args(args: &Args) -> Vec<String> {
     let mut v = vec!["--port".into(), args.port.to_string(), "--bitrate".into(), args.bitrate.to_string(), "--fec".into(), args.fec.to_string()];
+    if let Some(name) = &args.name {
+        v.extend(["--name".into(), name.clone()]);
+    }
     if let Some(fps) = args.fps {
         v.extend(["--fps".into(), fps.to_string()]);
     }
@@ -138,14 +137,7 @@ fn service_body() -> Result<()> {
 
     let result = (|| -> Result<()> {
         let args = SERVICE_ARGS.get().context("缺少服务参数")?;
-        let password = std::fs::read_to_string(password_file()).context("读取密码文件失败，请重新运行 `rc-host install`")?;
-        let password = password.trim();
-        if password.is_empty() {
-            bail!("密码文件为空，请重新运行 `rc-host install`");
-        }
         log(&format!("服务已启动，端口 {}", args.port));
-        // 工作进程从环境变量读取密码（clap 的 env = "RC_PASSWORD"）。
-        std::env::set_var("RC_PASSWORD", password);
         supervise(args, &stop_rx);
         Ok(())
     })();
@@ -300,7 +292,11 @@ fn spawn_worker(args: &Args, session: u32) -> Result<Worker> {
                 ..Default::default()
             };
             let exe = std::env::current_exe()?;
-            let cmdline = format!("\"{}\" {}", exe.display(), worker_args(args).join(" "));
+            let quoted: Vec<String> = worker_args(args)
+                .into_iter()
+                .map(|a| if a.contains(' ') || a.is_empty() { format!("\"{}\"", a.replace('"', "\\\"")) } else { a })
+                .collect();
+            let cmdline = format!("\"{}\" {}", exe.display(), quoted.join(" "));
             let mut cmdline = wide(OsStr::new(&cmdline));
             let mut info = PROCESS_INFORMATION::default();
             let created = CreateProcessAsUserW(
@@ -453,12 +449,10 @@ pub fn install(args: &Args) -> Result<()> {
     std::fs::create_dir_all(&data)?;
     let data_str = data.to_string_lossy();
     if !quiet("icacls", &[&data_str, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"]) {
-        eprintln!("警告：设置 {} 的访问权限失败，密码文件可能对其他用户可读", data.display());
+        eprintln!("警告：设置 {} 的访问权限失败，配对信息可能对其他用户可读", data.display());
     }
-    // 重新安装（升级）时沿用原密码，除非显式指定了新密码。
-    let old_password = std::fs::read_to_string(password_file()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let password = args.password.clone().or(old_password).unwrap_or_else(crate::generate_password);
-    std::fs::write(password_file(), &password).context("写入密码文件")?;
+    // 旧版本的密码文件已不再使用
+    let _ = std::fs::remove_file(data.join("password.txt"));
 
     // 3. 防火墙：按程序放行入站（专用 / 域网络）。服务没有界面，不会弹出防火墙询问框。
     let exe_str = exe.to_string_lossy();
@@ -512,14 +506,15 @@ pub fn install(args: &Args) -> Result<()> {
 
     println!("已安装并启动系统服务「{DISPLAY_NAME}」，开机自动运行。");
     println!();
-    println!("  连接密码：{password}");
+    println!("  本机名称：{}", args.name.clone().unwrap_or_else(crate::trust::computer_name));
     println!("  端口：    {}", args.port);
     println!("  程序位置：{}", exe.display());
     println!("  运行日志：{}", log_file().display());
     println!();
-    println!("现在锁屏、登录界面和 UAC 弹窗也能看到并操作了。");
+    println!("控制端打开后会自动发现这台电脑。新设备第一次连接时，这里会弹窗请你确认配对码；");
+    println!("确认后该设备以后可以直接连接。锁屏、登录界面和 UAC 弹窗也能看到并操作。");
     println!("提示：如果之前手动运行的 rc-host 还开着，请先关掉它，否则端口会冲突。");
-    println!("修改密码或参数：重新执行 install 并带上新参数；卸载：rc-host uninstall");
+    println!("修改参数：重新执行 install 并带上新参数；查看/删除已配对设备：rc-host devices / rc-host forget <名称>；卸载：rc-host uninstall");
     println!("连不上时运行 rc-host status（或双击 diagnose.cmd）检查问题。");
     if !public.is_empty() {
         println!();
@@ -623,6 +618,12 @@ pub fn status() -> Result<()> {
     }
 
     // 4. 日志
+    println!();
+    println!("== 已配对的控制端 ==");
+    if let Err(e) = crate::list_devices() {
+        println!("（读取失败：{e:#}，需要管理员权限）");
+    }
+
     println!();
     println!("== 最近日志（{}）==", log_file().display());
     match std::fs::read(log_file()) {
