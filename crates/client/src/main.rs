@@ -1,5 +1,8 @@
 //! 控制端（macOS / Windows）：图形界面、远程画面窗口、剪贴板与文件、声音。
 
+// Windows：作为窗口程序运行，双击打开时不带黑色的控制台窗口。命令行用法见 main 里的 attach_console。
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 #[cfg(not(any(target_os = "macos", windows)))]
 fn main() {
     eprintln!("控制端只支持 macOS 和 Windows。");
@@ -13,10 +16,7 @@ mod awdl;
 /// Windows 上没有 AWDL
 #[cfg(windows)]
 mod awdl {
-    pub fn guard_installed() -> bool {
-        false
-    }
-    pub fn guard_outdated() -> bool {
+    pub fn enabled() -> bool {
         false
     }
     pub fn active() -> bool {
@@ -73,6 +73,8 @@ enum Cmd {
 #[cfg(any(target_os = "macos", windows))]
 fn main() -> anyhow::Result<()> {
     use clap::Parser;
+    #[cfg(windows)]
+    attach_console();
     match Cli::parse().cmd {
         None => gui::run(),
         Some(Cmd::View(args)) => app::run(args),
@@ -534,6 +536,18 @@ mod app {
         fn cursor_degenerate_window() {
             let _ = normalize_cursor((5.0, 5.0), (0.0, 0.0), (1920, 1080));
             let _ = normalize_cursor((5.0, 5.0), (100.0, 100.0), (0, 0));
+        }
+    }
+}
+
+/// Windows 窗口程序没有自己的控制台。从命令行运行时借用父进程（cmd / PowerShell）的控制台，
+/// 让命令行子命令的输出照常显示；输出已被重定向（例如界面启动画面窗口时接了管道）就不动。
+#[cfg(windows)]
+fn attach_console() {
+    use windows::Win32::System::Console::{AttachConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE};
+    unsafe {
+        if GetStdHandle(STD_ERROR_HANDLE).map_or(true, |h| h.is_invalid() || h.0.is_null()) {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
         }
     }
 }
