@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 
 const ICON_PNG: &[u8] = include_bytes!("../../../packaging/icon/icon-256.png");
 
-pub fn run() -> Result<()> {
+/// `background`：开机自启时只在托盘 / 菜单栏里启动，不显示主窗口。
+pub fn run(background: bool) -> Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("SuperControl")
         .with_inner_size([900.0, 620.0])
@@ -37,7 +38,7 @@ pub fn run() -> Result<()> {
     eframe::run_native(
         "SuperControl",
         options,
-        Box::new(|cc| Ok(Box::new(Gui::new(&cc.egui_ctx)))),
+        Box::new(move |cc| Ok(Box::new(Gui::new(&cc.egui_ctx, background)))),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -101,6 +102,10 @@ struct Session {
     stderr: Arc<Mutex<Vec<String>>>,
     /// 画面窗口已和对方完成握手（它在 stdout 打印“已连接…”时置位）。
     ready: Arc<AtomicBool>,
+    /// 远端的显示器名称与当前下标（画面窗口在 stdout 打印 `RC-DISPLAYS` 时更新）
+    displays: Arc<Mutex<(Vec<String>, u32)>>,
+    /// 画面窗口的标准输入：发 `display <下标>` 切换远端显示器
+    stdin: Option<std::process::ChildStdin>,
 }
 
 impl Session {
@@ -151,12 +156,31 @@ struct Gui {
     /// 底部提示：(内容, 是否错误, 出现时间)
     message: Option<(String, bool, Instant)>,
     screenshot: Option<(String, Instant)>,
+    /// 托盘 / 菜单栏图标（创建失败时为 None，关闭窗口就直接退出）
+    tray: Option<crate::tray::Tray>,
+    tray_rx: std::sync::mpsc::Receiver<crate::tray::TrayCmd>,
+    /// 主窗口当前隐藏在托盘里
+    hidden: bool,
+    /// 用户选择了退出（不再把关闭窗口当作隐藏）
+    quitting: bool,
+    /// 后台启动：第一帧画完后立即隐藏窗口
+    start_hidden: bool,
+    frames: u64,
+    /// 开机自动启动（读自系统的启动项）
+    autostart: bool,
 }
 
 impl Gui {
-    fn new(ctx: &egui::Context) -> Self {
+    fn new(ctx: &egui::Context, background: bool) -> Self {
         kit::apply_theme(ctx);
         kit::load_system_font(ctx);
+        let settings = config::settings();
+        let (tray_tx, tray_rx) = std::sync::mpsc::channel();
+        let tray = decode_png(ICON_PNG).and_then(|(rgba, _, _)| {
+            crate::tray::Tray::new(&rgba, settings.host, ctx.clone(), tray_tx)
+                .map_err(|e| eprintln!("创建托盘图标失败: {e:#}"))
+                .ok()
+        });
         let seen = Arc::new(Mutex::new(HashMap::new()));
         spawn_scanner(seen.clone(), ctx.clone());
         let logo = decode_png(ICON_PNG).map(|(rgba, w, h)| {
@@ -174,7 +198,7 @@ impl Gui {
             ip_checked: Instant::now(),
             seen,
             manual_addr: String::new(),
-            settings: config::settings(),
+            settings,
             awdl_guard: awdl::enabled(),
             awdl_active: awdl::active(),
             awdl_checked: Instant::now(),
@@ -187,6 +211,69 @@ impl Gui {
             screenshot: std::env::var("RC_GUI_SCREENSHOT")
                 .ok()
                 .map(|p| (p, Instant::now())),
+            tray,
+            tray_rx,
+            hidden: false,
+            quitting: false,
+            start_hidden: background,
+            frames: 0,
+            autostart: crate::autostart::enabled(),
+        }
+    }
+
+    /// 隐藏到托盘 / 菜单栏（被控端照常运行）。
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        self.hidden = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        crate::tray::set_dock_visible(false);
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.hidden = false;
+        crate::tray::set_dock_visible(true);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn set_host_enabled(&mut self, on: bool) {
+        self.settings.host = on;
+        let _ = config::save_settings(&self.settings);
+        self.host.error = None;
+        self.host.next_try = Instant::now();
+        if let Some(t) = &self.tray {
+            t.set_host(on);
+        }
+    }
+
+    /// 托盘菜单命令、关闭按钮、后台启动。
+    fn window_lifecycle(&mut self, ctx: &egui::Context) {
+        self.frames += 1;
+        if self.start_hidden && self.frames >= 2 && self.tray.is_some() {
+            // eframe 会在第一帧画完后显示窗口，所以第二帧再隐藏
+            self.start_hidden = false;
+            self.hide_window(ctx);
+        }
+        while let Ok(cmd) = self.tray_rx.try_recv() {
+            match cmd {
+                crate::tray::TrayCmd::Show => self.show_window(ctx),
+                crate::tray::TrayCmd::ToggleHost => {
+                    let on = self.tray.as_ref().map(|t| t.host_checked()).unwrap_or(!self.settings.host);
+                    self.set_host_enabled(on);
+                }
+                crate::tray::TrayCmd::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.quitting
+            && self.settings.close_to_tray
+            && self.tray.is_some()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_window(ctx);
         }
     }
 
@@ -676,6 +763,7 @@ impl Gui {
         if !self.sessions.is_empty() {
             Self::section_label(ui, "正在控制");
             let mut kill = None;
+            let mut select = None;
             for (i, s) in self.sessions.iter().enumerate() {
                 kit::card()
                     .inner_margin(Margin::symmetric(16, 12))
@@ -698,7 +786,26 @@ impl Gui {
                                 },
                             );
                         });
+                        // 远端有多块显示器：在这里切换（画面窗口里也可以用快捷键）
+                        let (names, current) = s.displays.lock().unwrap().clone();
+                        if names.len() > 1 {
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("显示器").size(12.5).color(kit::TEXT_WEAK));
+                                for (d, name) in names.iter().enumerate() {
+                                    if kit::segment(ui, name, d as u32 == current).clicked() && d as u32 != current {
+                                        select = Some((i, d));
+                                    }
+                                }
+                            });
+                        }
                     });
+            }
+            if let Some((i, d)) = select {
+                if let Some(stdin) = self.sessions[i].stdin.as_mut() {
+                    use std::io::Write;
+                    let _ = writeln!(stdin, "display {d}").and_then(|_| stdin.flush());
+                }
             }
             if let Some(i) = kill {
                 let mut s = self.sessions.remove(i);
@@ -836,6 +943,37 @@ impl Gui {
         Self::page_header(ui, "设置", "调整控制方式、被控制选项和网络");
         ui.add_space(14.0);
 
+        // ---- 通用 ----
+        Self::section_label(ui, "通用");
+        kit::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let mut auto = self.autostart;
+            kit::setting_row(ui, "开机时自动启动", "登录后在后台启动 SuperControl（不弹出窗口），保持可被控制", 60.0, |ui| {
+                if ui.add(Toggle(&mut auto)).changed() {
+                    match crate::autostart::set(auto) {
+                        Ok(()) => self.autostart = auto,
+                        Err(e) => self.message = Some((format!("{e:#}"), true, Instant::now())),
+                    }
+                }
+            });
+            kit::divider(ui);
+            let place = if cfg!(target_os = "macos") { "菜单栏" } else { "任务栏托盘" };
+            let mut to_tray = self.settings.close_to_tray;
+            kit::setting_row(
+                ui,
+                &format!("关闭窗口时隐藏到{place}"),
+                &format!("被控端继续运行，点{place}里的图标可以重新打开；从图标菜单里选“退出”才会完全退出"),
+                60.0,
+                |ui| {
+                    if ui.add(Toggle(&mut to_tray)).changed() {
+                        self.settings.close_to_tray = to_tray;
+                        let _ = config::save_settings(&self.settings);
+                    }
+                },
+            );
+        });
+        ui.add_space(10.0);
+
         // ---- 控制其他电脑 ----
         Self::section_label(ui, "控制其他电脑");
         let mut changed = false;
@@ -882,10 +1020,7 @@ impl Gui {
             let (text, dot) = self.host_status();
             kit::setting_row(ui, "允许其他设备控制这台电脑", "只在 SuperControl 打开期间可被控制；新设备第一次连接时，需要在这台电脑上确认配对码", 200.0, |ui| {
                 if ui.add(Toggle(&mut on)).changed() {
-                    self.settings.host = on;
-                    let _ = config::save_settings(&self.settings);
-                    self.host.error = None;
-                    self.host.next_try = Instant::now();
+                    self.set_host_enabled(on);
                 }
                 kit::chip(ui, text, dot);
             });
@@ -1219,6 +1354,7 @@ impl eframe::App for Gui {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
         let ctx = ui.ctx().clone();
+        self.window_lifecycle(&ctx);
         ctx.request_repaint_after(Duration::from_millis(500));
 
         egui::Panel::left("nav")
@@ -1323,22 +1459,30 @@ fn spawn_viewer(
         cmd.arg("--no-audio");
     }
     let mut child = cmd
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     let ready = Arc::new(AtomicBool::new(false));
+    let displays = Arc::new(Mutex::new((Vec::new(), 0)));
     if let Some(pipe) = child.stdout.take() {
-        let ready = ready.clone();
+        let (ready, displays) = (ready.clone(), displays.clone());
         // 一直读到进程退出，否则管道写满会卡住画面窗口
         std::thread::spawn(move || {
             for line in std::io::BufReader::new(pipe).lines().map_while(|l| l.ok()) {
                 if line.starts_with("已连接") {
                     ready.store(true, Ordering::Relaxed);
+                } else if let Some(rest) = line.strip_prefix("RC-DISPLAYS ") {
+                    // RC-DISPLAYS <当前下标> <名称1>|<名称2>|…
+                    if let Some((cur, names)) = rest.split_once(' ') {
+                        let names = names.split('|').map(str::to_string).collect();
+                        *displays.lock().unwrap() = (names, cur.parse().unwrap_or(0));
+                    }
                 }
             }
         });
     }
+    let stdin = child.stdin.take();
     let stderr = Arc::new(Mutex::new(Vec::new()));
     if let Some(pipe) = child.stderr.take() {
         let lines = stderr.clone();
@@ -1357,6 +1501,8 @@ fn spawn_viewer(
         child,
         stderr,
         ready,
+        displays,
+        stdin,
     })
 }
 

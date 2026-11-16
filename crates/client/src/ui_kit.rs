@@ -130,6 +130,13 @@ pub fn secondary_button(ui: &mut Ui, text: &str) -> Response {
     .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// 分段选择按钮：选中时黑底白字，否则浅灰底。
+pub fn segment(ui: &mut Ui, text: &str, selected: bool) -> Response {
+    let (fg, bg) = if selected { (Color32::WHITE, BLACK) } else { (TEXT, FILL) };
+    ui.add(egui::Button::new(RichText::new(text).size(12.5).color(fg)).fill(bg).stroke(Stroke::NONE).corner_radius(7))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// 文字按钮（无底色）。
 pub fn text_button(ui: &mut Ui, text: &str, color: Color32) -> Response {
     ui.add(egui::Button::new(RichText::new(text).color(color).size(13.0)).frame(false))

@@ -7,7 +7,7 @@ pub mod input;
 pub mod power;
 mod vt;
 
-use crate::source::{encode_size, EncodedFrame, VideoSource};
+use crate::source::{encode_size, Area, EncodedFrame, VideoSource};
 use crate::{now_us, Args};
 use anyhow::{bail, Context, Result};
 use screencapturekit::cm::SCFrameStatus;
@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGMainDisplayID() -> u32;
+    fn CGDisplayIsBuiltin(id: u32) -> u32;
     fn CGDisplayCopyDisplayMode(id: u32) -> *mut c_void;
     fn CGDisplayModeGetPixelWidth(mode: *mut c_void) -> usize;
     fn CGDisplayModeGetPixelHeight(mode: *mut c_void) -> usize;
@@ -65,10 +66,10 @@ pub fn request_permissions() {
     }
 }
 
-/// 主显示器的像素尺寸与刷新率。
-fn main_display_mode() -> (u32, u32, u32) {
+/// 显示器的像素尺寸与刷新率。
+fn display_mode(id: u32) -> (u32, u32, u32) {
     unsafe {
-        let mode = CGDisplayCopyDisplayMode(CGMainDisplayID());
+        let mode = CGDisplayCopyDisplayMode(id);
         if mode.is_null() {
             return (1920, 1080, 60);
         }
@@ -82,6 +83,30 @@ fn main_display_mode() -> (u32, u32, u32) {
     }
 }
 
+/// 显示器在全局坐标中的位置（点）：(x, y, 宽, 高)。
+fn display_bounds(id: u32) -> (f64, f64, f64, f64) {
+    let r = unsafe { input::CGDisplayBounds(id) };
+    (r.origin.x, r.origin.y, r.size.w, r.size.h)
+}
+
+/// 可采集的显示器：主显示器在前，其余按从左到右排。
+fn display_ids(content: &SCShareableContent) -> Vec<u32> {
+    let main = unsafe { CGMainDisplayID() };
+    let mut ids: Vec<u32> = content.displays().iter().map(|d| d.display_id()).collect();
+    ids.sort_by(|a, b| (*a != main).cmp(&(*b != main)).then(display_bounds(*a).0.total_cmp(&display_bounds(*b).0)));
+    ids
+}
+
+fn shareable() -> Result<SCShareableContent> {
+    SCShareableContent::get().map_err(|e| anyhow::anyhow!("{NEED_SCREEN}（{e:?}）"))
+}
+
+fn display_filter(content: &SCShareableContent, id: u32) -> Result<SCContentFilter> {
+    let displays = content.displays();
+    let display = displays.iter().find(|d| d.display_id() == id).context("显示器已断开")?;
+    SCContentFilter::create().with_display(display).with_excluding_windows(&[]).build().map_err(|e| anyhow::anyhow!("{e:?}"))
+}
+
 type Latest = (Mutex<Option<(CVPixelBuffer, u64)>>, Condvar);
 
 pub struct MacSource {
@@ -92,7 +117,14 @@ pub struct MacSource {
     last: Option<CVPixelBuffer>,
     size: (u32, u32),
     fps: u32,
+    fps_arg: Option<u32>,
     bitrate: u32,
+    /// 正在采集的显示器（CGDirectDisplayID）
+    display: u32,
+    /// 控制端窗口像素尺寸；(0, 0) 表示原始分辨率
+    viewport: (u32, u32),
+    /// 与输入注入共享的当前显示器位置
+    area: Area,
     pending_key: bool,
     frame_interval: Duration,
 }
@@ -113,13 +145,11 @@ impl MacSource {
         if !unsafe { CGPreflightScreenCaptureAccess() } {
             bail!("{NEED_SCREEN}");
         }
-        let (w, h, refresh) = main_display_mode();
+        let content = shareable()?;
+        let display = *display_ids(&content).first().context("没有找到显示器")?;
+        let (w, h, refresh) = display_mode(display);
         let fps = args.fps.unwrap_or(refresh).clamp(1, 240);
-        let content = SCShareableContent::get().map_err(|e| anyhow::anyhow!("{NEED_SCREEN}（{e:?}）"))?;
-        let main = unsafe { CGMainDisplayID() };
-        let displays = content.displays();
-        let display = displays.iter().find(|d| d.display_id() == main).or(displays.first()).context("没有找到显示器")?;
-        let filter = SCContentFilter::create().with_display(display).with_excluding_windows(&[]).build().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let filter = display_filter(&content, display)?;
 
         let latest: Arc<Latest> = Arc::new((Mutex::new(None), Condvar::new()));
         let mut stream = SCStream::new(&filter, &stream_config(w, h, fps)).map_err(|e| anyhow::anyhow!("创建采集流失败: {e:?}"))?;
@@ -155,14 +185,73 @@ impl MacSource {
             last: None,
             size: (w, h),
             fps,
+            fps_arg: args.fps,
             bitrate: args.bitrate,
+            display,
+            viewport: (0, 0),
+            area: Arc::new(Mutex::new(display_bounds(display))),
             pending_key: true,
             frame_interval: Duration::from_secs(1) / fps,
         })
     }
 }
 
+impl MacSource {
+    /// 当前显示器的位置，交给输入注入使用（切换显示器时随之更新）。
+    pub fn area(&self) -> Area {
+        self.area.clone()
+    }
+}
+
 impl VideoSource for MacSource {
+    fn displays(&self) -> Vec<rc_protocol::DisplayInfo> {
+        let Ok(content) = shareable() else { return Vec::new() };
+        let main = unsafe { CGMainDisplayID() };
+        display_ids(&content)
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let (width, height, _) = display_mode(id);
+                let builtin = unsafe { CGDisplayIsBuiltin(id) } != 0;
+                rc_protocol::DisplayInfo {
+                    name: if builtin { "内建显示器".into() } else { format!("显示器 {}", i + 1) },
+                    width,
+                    height,
+                    primary: id == main,
+                }
+            })
+            .collect()
+    }
+
+    fn current_display(&self) -> u32 {
+        shareable().map(|c| display_ids(&c).iter().position(|&id| id == self.display).unwrap_or(0) as u32).unwrap_or(0)
+    }
+
+    fn select_display(&mut self, index: u32) -> Result<()> {
+        let content = shareable()?;
+        let id = *display_ids(&content).get(index as usize).context("没有这块显示器")?;
+        if id == self.display {
+            return Ok(());
+        }
+        let filter = display_filter(&content, id)?;
+        let (w, h, refresh) = display_mode(id);
+        let fps = self.fps_arg.unwrap_or(refresh).clamp(1, 240);
+        let (ew, eh) = encode_size((w, h), self.viewport);
+        self.stream.update_content_filter(&filter).map_err(|e| anyhow::anyhow!("切换显示器失败: {e:?}"))?;
+        self.stream.update_configuration(&stream_config(ew, eh, fps)).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        self.enc = vt::Encoder::new(ew, eh, fps, self.bitrate)?;
+        self.filter = filter;
+        self.display = id;
+        self.size = (w, h);
+        self.fps = fps;
+        self.frame_interval = Duration::from_secs(1) / fps;
+        self.last = None;
+        self.pending_key = true;
+        *self.area.lock().unwrap() = display_bounds(id);
+        println!("采集显示器 {id}：{w}x{h} @ {refresh}Hz，编码 {ew}x{eh}");
+        Ok(())
+    }
+
     // 读不到其他应用光标的可靠形状（系统箭头、I 形光标是动态生成的），所以光标直接画在画面里
     fn cursor(&mut self) -> Option<rc_protocol::CursorShape> {
         Some(rc_protocol::CursorShape::InVideo)
@@ -182,6 +271,7 @@ impl VideoSource for MacSource {
 
     /// ScreenCaptureKit 直接按窗口尺寸输出（显卡上缩放，不额外消耗），编码器随之重建。
     fn set_viewport(&mut self, width: u32, height: u32) -> Result<()> {
+        self.viewport = (width, height);
         let (w, h) = encode_size(self.size, (width, height));
         if (w, h) == (self.enc.width, self.enc.height) {
             return Ok(());

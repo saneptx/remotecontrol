@@ -31,6 +31,10 @@ mod config;
 #[cfg(any(target_os = "macos", windows))]
 mod ui_kit;
 #[cfg(any(target_os = "macos", windows))]
+mod autostart;
+#[cfg(any(target_os = "macos", windows))]
+mod tray;
+#[cfg(any(target_os = "macos", windows))]
 mod datalink;
 #[cfg(target_os = "macos")]
 #[path = "display_mac.rs"]
@@ -57,6 +61,9 @@ mod winhost;
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
+    /// 后台启动（开机自启用）：不显示主窗口，只在托盘 / 菜单栏里
+    #[arg(long, hide = true)]
+    background: bool,
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -77,8 +84,9 @@ fn main() -> anyhow::Result<()> {
     use clap::Parser;
     #[cfg(windows)]
     attach_console();
-    match Cli::parse().cmd {
-        None => gui::run(),
+    let cli = Cli::parse();
+    match cli.cmd {
+        None => gui::run(cli.background),
         Some(Cmd::View(args)) => app::run(args),
         Some(Cmd::Scan) => {
             let found = net::discover(std::time::Duration::from_millis(800))?;
@@ -161,7 +169,14 @@ mod app {
     enum UserEvent {
         Disconnected,
         Cursor(rc_protocol::CursorShape),
+        /// 被控端的显示器列表与当前显示器
+        Displays(Vec<rc_protocol::DisplayInfo>, u32),
+        /// 切换到第几块显示器（来自主界面，经标准输入）
+        SelectDisplay(u32),
     }
+
+    /// 切换显示器的快捷键说明（显示用）。
+    const DISPLAY_KEYS: &str = if cfg!(target_os = "macos") { "⌃⌥← / ⌃⌥→" } else { "Ctrl+Alt+← / →" };
 
     /// 被控端光标形状 → 本地系统光标；`None` 表示隐藏本地光标。
     fn cursor_icon(shape: rc_protocol::CursorShape) -> Option<winit::window::CursorIcon> {
@@ -204,6 +219,9 @@ mod app {
         mods: winit::keyboard::ModifiersState,
         /// 被本地快捷键吃掉的按键：抬起时也不发给远端
         swallowed: HashSet<winit::keyboard::KeyCode>,
+        /// 被控端的显示器列表与当前显示的那块
+        displays: Vec<rc_protocol::DisplayInfo>,
+        current_display: u32,
     }
 
     pub fn run(args: ViewArgs) -> Result<()> {
@@ -238,7 +256,21 @@ mod app {
             audio: None,
             mods: Default::default(),
             swallowed: HashSet::new(),
+            displays: Vec::new(),
+            current_display: 0,
         };
+        // 主界面通过标准输入发命令：`display <下标>` 切换远端显示器
+        {
+            let proxy = event_loop.create_proxy();
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::stdin().lock().lines().map_while(|l| l.ok()) {
+                    if let Some(i) = line.strip_prefix("display ").and_then(|v| v.trim().parse().ok()) {
+                        let _ = proxy.send_event(UserEvent::SelectDisplay(i));
+                    }
+                }
+            });
+        }
         event_loop.run_app(&mut app)?;
         Ok(())
     }
@@ -295,12 +327,15 @@ mod app {
                 }
                 Err(e) => eprintln!("数据通道不可用（剪贴板与文件传输不可用）: {e:#}"),
             }
-            let (proxy, cursor_proxy) = (self.proxy.clone(), self.proxy.clone());
+            let (proxy, cursor_proxy, displays_proxy) = (self.proxy.clone(), self.proxy.clone(), self.proxy.clone());
             net::spawn_control_reader(
                 conn.tcp,
                 self.shared.clone(),
                 move |shape| {
                     let _ = cursor_proxy.send_event(UserEvent::Cursor(shape));
+                },
+                move |list, current| {
+                    let _ = displays_proxy.send_event(UserEvent::Displays(list, current));
                 },
                 move || {
                     let _ = proxy.send_event(UserEvent::Disconnected);
@@ -343,6 +378,10 @@ mod app {
                 if print_stats {
                     println!("{line}");
                 }
+                let host = match shared.display_label.lock().unwrap().as_deref() {
+                    Some(d) => format!("{host} · {d}"),
+                    None => host.clone(),
+                };
                 let title = match shared.notice.lock().unwrap().as_deref() {
                     Some(n) => format!("远程控制 - {host} · ⚠️ {n}"),
                     None => format!("远程控制 - {host} · {line}"),
@@ -366,6 +405,17 @@ mod app {
                 (size.width, size.height)
             };
             control.send(&ClientMsg::Viewport { width, height });
+        }
+
+        fn select_display(&mut self, index: u32) {
+            if index as usize >= self.displays.len() || index == self.current_display {
+                return;
+            }
+            // 松开按着的键，免得切换过程中远端卡键
+            self.release_all();
+            if let Some(c) = &self.control {
+                c.send(&ClientMsg::SelectDisplay { index });
+            }
         }
 
         fn send(&self, ev: InputEvent) {
@@ -443,6 +493,20 @@ mod app {
                     eprintln!("连接已断开");
                     event_loop.exit();
                 }
+                UserEvent::Displays(list, current) => {
+                    if let Some(d) = list.get(current as usize) {
+                        // 鼠标坐标按新显示器的宽高比换算（画面等比缩放，可能有黑边）
+                        self.video_size = (d.width, d.height);
+                        *self.shared.display_label.lock().unwrap() = (list.len() > 1)
+                            .then(|| format!("{}（{}/{}，{DISPLAY_KEYS} 切换）", d.name, current + 1, list.len()));
+                    }
+                    // 告诉主界面（它读本进程的标准输出）：当前下标 + 各显示器名称
+                    let names: Vec<String> = list.iter().map(|d| d.name.replace('|', " ")).collect();
+                    println!("RC-DISPLAYS {current} {}", names.join("|"));
+                    self.displays = list;
+                    self.current_display = current;
+                }
+                UserEvent::SelectDisplay(index) => self.select_display(index),
                 UserEvent::Cursor(shape) => {
                     if self.args.stats {
                         println!("光标: {shape:?}");
@@ -533,6 +597,17 @@ mod app {
                             if let Some(d) = &self.data {
                                 d.fetch_remote_files();
                             }
+                        }
+                        return;
+                    }
+                    // ⌃⌥← / ⌃⌥→（Windows 上 Ctrl+Alt+← / →）：切换远端的显示器
+                    use winit::keyboard::KeyCode::{ArrowLeft, ArrowRight};
+                    if matches!(code, ArrowLeft | ArrowRight) && self.mods.control_key() && self.mods.alt_key() && self.displays.len() > 1 {
+                        if event.state == ElementState::Pressed && !event.repeat {
+                            self.swallowed.insert(code);
+                            let n = self.displays.len() as u32;
+                            let next = if code == ArrowRight { (self.current_display + 1) % n } else { (self.current_display + n - 1) % n };
+                            self.select_display(next);
                         }
                         return;
                     }

@@ -22,6 +22,48 @@ pub enum State {
     Unavailable,
 }
 
+/// 一块接在桌面上的显示器（某块显卡的某个输出）。
+pub struct OutputInfo {
+    adapter: u32,
+    output: u32,
+    /// 例如 `\\.\DISPLAY1`
+    pub device: String,
+    /// 在虚拟桌面中的 (left, top, width, height)
+    pub rect: (i32, i32, u32, u32),
+}
+
+impl OutputInfo {
+    pub fn primary(&self) -> bool {
+        self.rect.0 == 0 && self.rect.1 == 0
+    }
+}
+
+/// 所有显示器，顺序为“显卡 → 输出”，与 [`Capturer::new`] 的下标一致。
+pub fn list_outputs() -> Vec<OutputInfo> {
+    let mut list = Vec::new();
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else { return list };
+        for a in (0..).map_while(|i| factory.EnumAdapters1(i).ok().map(|ad| (i, ad))) {
+            for (o, out) in (0..).map_while(|j| a.1.EnumOutputs(j).ok().map(|out| (j, out))) {
+                let Ok(desc) = out.GetDesc() else { continue };
+                if !desc.AttachedToDesktop.as_bool() {
+                    continue;
+                }
+                let r = desc.DesktopCoordinates;
+                let device = String::from_utf16_lossy(&desc.DeviceName).trim_end_matches('\0').to_string();
+                list.push(OutputInfo {
+                    adapter: a.0,
+                    output: o,
+                    device,
+                    rect: (r.left, r.top, (r.right - r.left) as u32, (r.bottom - r.top) as u32),
+                });
+            }
+        }
+    }
+    list
+}
+
 pub struct Capturer {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -40,19 +82,21 @@ pub struct Capturer {
 }
 
 impl Capturer {
-    pub fn new() -> Result<Self> {
+    /// 采集 [`list_outputs`] 中的第 `index` 块显示器。
+    pub fn new(index: usize) -> Result<Self> {
         unsafe {
             // 不声明 DPI 感知的话，坐标和尺寸会被系统缩放。
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
             super::desktop::sync_thread();
 
-            let factory: IDXGIFactory1 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
-            // 取第一块接有显示器的显卡的第一个输出（通常就是主显示器）。
-            let (adapter, output) = (0..)
-                .map_while(|i| factory.EnumAdapters1(i).ok())
-                .find_map(|a| a.EnumOutputs(0).ok().map(|o| (a, o)))
+            let outputs = list_outputs();
+            let info = outputs
+                .get(index)
+                .or(outputs.first())
                 .context("没有找到已连接的显示器（显示器关闭后可能会断开；无头机器需要接 HDMI 诱骗器）")?;
-            let output: IDXGIOutput1 = output.cast()?;
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
+            let adapter = factory.EnumAdapters1(info.adapter).context("EnumAdapters1")?;
+            let output: IDXGIOutput1 = adapter.EnumOutputs(info.output).context("EnumOutputs")?.cast()?;
 
             let mut device = None;
             let mut context = None;

@@ -17,7 +17,7 @@ pub mod video;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const DEFAULT_PORT: u16 = 47800;
 /// 局域网发现使用的 UDP 端口。
 pub const DISCOVERY_PORT: u16 = 47801;
@@ -71,6 +71,8 @@ pub enum ClientMsg {
     /// 控制端窗口的实际像素尺寸。被控端按它缩小编码分辨率（不放大），
     /// 避免编码最终看不到的像素。`0x0` 表示要求原始分辨率。
     Viewport { width: u32, height: u32 },
+    /// 切换到被控端的第 `index` 块显示器（下标对应 [`HostMsg::Displays`] 的列表）。
+    SelectDisplay { index: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -90,6 +92,18 @@ pub enum HostMsg {
     Notice { text: Option<String> },
     /// 被控端当前的光标形状，变化时发送；控制端把本地光标换成同样的形状。
     Cursor { shape: CursorShape },
+    /// 被控端的显示器列表和当前显示的那块；连接后发送一次，切换显示器后再发送。
+    Displays { list: Vec<DisplayInfo>, current: u32 },
+}
+
+/// 被控端的一块显示器。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DisplayInfo {
+    pub name: String,
+    /// 像素尺寸
+    pub width: u32,
+    pub height: u32,
+    pub primary: bool,
 }
 
 /// 光标形状（系统标准光标）。应用自绘的光标按箭头处理。

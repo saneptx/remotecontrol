@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand};
 use rc_protocol::{self as proto, video, ClientMsg, HostMsg};
 use source::{InputSink, VideoSource};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -377,9 +377,11 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
     const NO_VIEWPORT: u64 = u64::MAX;
     let viewport = Arc::new(AtomicU64::new(NO_VIEWPORT));
     let want_key = Arc::new(AtomicBool::new(true));
+    // 控制端要求切换的显示器：下标 + 1，0 表示没有请求
+    let select = Arc::new(AtomicU32::new(0));
     let writer = Arc::new(Mutex::new(tcp.try_clone()?));
     let reader = {
-        let (alive, want_key, writer, viewport) = (alive.clone(), want_key.clone(), writer.clone(), viewport.clone());
+        let (alive, want_key, writer, viewport, select) = (alive.clone(), want_key.clone(), writer.clone(), viewport.clone(), select.clone());
         std::thread::spawn(move || {
             loop {
                 match proto::read_msg::<ClientMsg>(&mut tcp) {
@@ -388,6 +390,7 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
                         viewport.store(((width as u64) << 32) | height as u64, Ordering::Relaxed)
                     }
                     Ok(ClientMsg::RequestKeyframe) => want_key.store(true, Ordering::Relaxed),
+                    Ok(ClientMsg::SelectDisplay { index }) => select.store(index.saturating_add(1), Ordering::Relaxed),
                     Ok(ClientMsg::Ping { t_us }) => {
                         let pong = HostMsg::Pong { t_us, host_us: now_us() };
                         if proto::write_msg(&mut *writer.lock().unwrap(), &pong).is_err() {
@@ -408,6 +411,14 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
         let mut notice: Option<String> = None;
         let mut cursor: Option<proto::CursorShape> = None;
         let mut loss = SimLoss::new(args.sim_loss);
+        let send_displays = |src: &dyn VideoSource| -> Result<()> {
+            let list = src.displays();
+            if !list.is_empty() {
+                proto::write_msg(&mut *writer.lock().unwrap(), &HostMsg::Displays { list, current: src.current_display() })?;
+            }
+            Ok(())
+        };
+        send_displays(&*video_src)?;
         // 窗口拖动缩放时会连续收到很多尺寸：稳定 300ms 后才重建编码器。第一次立即生效。
         let (mut applied_vp, mut pending_vp) = (NO_VIEWPORT, NO_VIEWPORT);
         let mut pending_since = Instant::now();
@@ -421,6 +432,22 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
             if pending_vp != applied_vp && pending_vp != NO_VIEWPORT && settled {
                 video_src.set_viewport((pending_vp >> 32) as u32, pending_vp as u32)?;
                 applied_vp = pending_vp;
+            }
+
+            let sel = select.swap(0, Ordering::Relaxed);
+            if sel > 0 {
+                match video_src.select_display(sel - 1) {
+                    Ok(()) => {
+                        let (w, h) = video_src.size();
+                        println!("已切换到显示器 {}（{w}x{h}）", sel);
+                        // 新显示器的尺寸可能不同：按控制端窗口重新确定编码分辨率
+                        applied_vp = NO_VIEWPORT;
+                        want_key.store(true, Ordering::Relaxed);
+                    }
+                    Err(e) => eprintln!("切换到显示器 {sel} 失败: {e:#}"),
+                }
+                // 不管成功与否都告诉控制端当前是哪一块，它的界面据此更新
+                send_displays(&*video_src)?;
             }
 
             let force_key = want_key.swap(false, Ordering::Relaxed);
@@ -544,7 +571,7 @@ impl SimLoss {
 #[cfg(windows)]
 fn open_platform(args: &Args) -> Result<(Box<dyn VideoSource>, Box<dyn InputSink>)> {
     let src = win::WinSource::new(args)?;
-    let input = win::input::Injector::new(src.desktop_rect());
+    let input = win::input::Injector::new(src.area());
     Ok((Box::new(src), Box::new(input)))
 }
 
@@ -558,7 +585,8 @@ fn open_platform(args: &Args) -> Result<(Box<dyn VideoSource>, Box<dyn InputSink
     #[cfg(target_os = "macos")]
     if !test_source() {
         let src = mac::MacSource::new(args)?;
-        return Ok((Box::new(src), Box::new(mac::input::Injector::new())));
+        let input = mac::input::Injector::new(src.area());
+        return Ok((Box::new(src), Box::new(input)));
     }
     eprintln!("注意：使用测试图像源（ffmpeg testsrc2），输入事件只打印不注入。");
     Ok((Box::new(testsrc::TestSource::new(args)?), Box::new(testsrc::LogInput)))

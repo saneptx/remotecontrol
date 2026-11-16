@@ -1,6 +1,10 @@
 use anyhow::Result;
 use rc_protocol::InputEvent;
 
+/// 当前显示器在输入坐标系里的位置 (x, y, 宽, 高)：Windows 为虚拟桌面像素，macOS 为全局坐标（点）。
+/// 切换显示器时由采集端更新，注入端每次移动鼠标时读取。
+pub type Area = std::sync::Arc<std::sync::Mutex<(f64, f64, f64, f64)>>;
+
 /// 一帧已编码的 HEVC Annex-B 访问单元。
 pub struct EncodedFrame {
     pub data: Vec<u8>,
@@ -15,6 +19,18 @@ pub trait VideoSource {
     /// 需要告知控制端的状态（例如处于锁屏、无法采集）。
     fn notice(&self) -> Option<String> {
         None
+    }
+    /// 所有显示器（只有一块或不支持切换时可以返回空列表）。
+    fn displays(&self) -> Vec<rc_protocol::DisplayInfo> {
+        Vec::new()
+    }
+    /// 当前采集的显示器在 [`Self::displays`] 中的下标。
+    fn current_display(&self) -> u32 {
+        0
+    }
+    /// 切换到另一块显示器。失败时保持原来的显示器。
+    fn select_display(&mut self, _index: u32) -> Result<()> {
+        anyhow::bail!("不支持切换显示器")
     }
     /// 当前光标形状（每帧查询一次，变化时发给控制端）。`None` 表示不支持。
     fn cursor(&mut self) -> Option<rc_protocol::CursorShape> {

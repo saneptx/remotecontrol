@@ -246,6 +246,8 @@ pub struct Shared {
     rtt_us: AtomicU64,
     /// 被控端发来的状态提示。
     pub notice: Mutex<Option<String>>,
+    /// 被控端有多块显示器时，当前显示的是哪一块（显示在窗口标题里）。
+    pub display_label: Mutex<Option<String>>,
 }
 
 /// 读控制通道：处理 Pong 估算时钟差；连接断开时调用 `on_closed`。
@@ -253,6 +255,7 @@ pub fn spawn_control_reader(
     mut tcp: TcpStream,
     shared: Arc<Shared>,
     on_cursor: impl Fn(proto::CursorShape) + Send + 'static,
+    on_displays: impl Fn(Vec<proto::DisplayInfo>, u32) + Send + 'static,
     on_closed: impl FnOnce() + Send + 'static,
 ) {
     std::thread::spawn(move || {
@@ -260,6 +263,8 @@ pub fn spawn_control_reader(
         while let Ok(msg) = proto::read_msg::<HostMsg>(&mut tcp) {
             if let HostMsg::Cursor { shape } = msg {
                 on_cursor(shape);
+            } else if let HostMsg::Displays { list, current } = msg {
+                on_displays(list, current);
             } else if let HostMsg::Notice { text } = msg {
                 match &text {
                     Some(t) => eprintln!("被控端: {t}"),

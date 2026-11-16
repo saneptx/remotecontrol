@@ -1,6 +1,6 @@
 //! macOS 输入注入（CGEvent）。需要“辅助功能”权限。
 
-use crate::source::InputSink;
+use crate::source::{Area, InputSink};
 use rc_protocol::InputEvent;
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -8,23 +8,23 @@ use std::time::{Duration, Instant};
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct CGPoint {
-    x: f64,
-    y: f64,
+pub(crate) struct CGPoint {
+    pub x: f64,
+    pub y: f64,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct CGSize {
-    w: f64,
-    h: f64,
+pub(crate) struct CGSize {
+    pub w: f64,
+    pub h: f64,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct CGRect {
-    origin: CGPoint,
-    size: CGSize,
+pub(crate) struct CGRect {
+    pub origin: CGPoint,
+    pub size: CGSize,
 }
 
 type Ev = *mut c_void;
@@ -39,8 +39,7 @@ extern "C" {
     fn CGEventSetFlags(ev: Ev, flags: u64);
     fn CGEventSetIntegerValueField(ev: Ev, field: u32, value: i64);
     fn CGEventPost(tap: u32, ev: Ev);
-    fn CGMainDisplayID() -> u32;
-    fn CGDisplayBounds(id: u32) -> CGRect;
+    pub(crate) fn CGDisplayBounds(id: u32) -> CGRect;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -114,6 +113,8 @@ fn modifier_flag(keycode: u16) -> Option<u64> {
 }
 
 pub struct Injector {
+    /// 当前显示器在全局坐标中的位置
+    area: Area,
     source: *mut c_void,
     pos: CGPoint,
     buttons: HashSet<u8>,
@@ -127,9 +128,9 @@ pub struct Injector {
 unsafe impl Send for Injector {}
 
 impl Injector {
-    pub fn new() -> Self {
+    pub fn new(area: Area) -> Self {
         let source = unsafe { CGEventSourceCreate(HID_SYSTEM_STATE) };
-        Self { source, pos: CGPoint::default(), buttons: HashSet::new(), keys: HashSet::new(), flags: 0, last_click: None, wheel_acc: (0.0, 0.0) }
+        Self { area, source, pos: CGPoint::default(), buttons: HashSet::new(), keys: HashSet::new(), flags: 0, last_click: None, wheel_acc: (0.0, 0.0) }
     }
 
     fn post(&self, ev: Ev) {
@@ -215,11 +216,9 @@ impl InputSink for Injector {
     fn inject(&mut self, ev: InputEvent) {
         match ev {
             InputEvent::MouseMoveAbs { x, y } => {
-                let b = unsafe { CGDisplayBounds(CGMainDisplayID()) };
-                self.pos = CGPoint {
-                    x: b.origin.x + x as f64 / 65535.0 * (b.size.w - 1.0),
-                    y: b.origin.y + y as f64 / 65535.0 * (b.size.h - 1.0),
-                };
+                // 当前显示器在全局坐标中的位置（切换显示器时由采集端更新）
+                let (bx, by, bw, bh) = *self.area.lock().unwrap();
+                self.pos = CGPoint { x: bx + x as f64 / 65535.0 * (bw - 1.0), y: by + y as f64 / 65535.0 * (bh - 1.0) };
                 // 按住按钮时要发“拖动”事件，否则拖拽、框选无效
                 let (ty, number) = match self.buttons.iter().min() {
                     Some(&b) => {

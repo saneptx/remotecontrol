@@ -31,6 +31,9 @@ pub struct Settings {
     /// 界面打开期间允许其他设备控制本机
     #[serde(default = "yes")]
     pub host: bool,
+    /// 关闭主窗口时隐藏到托盘 / 菜单栏，而不是退出
+    #[serde(default = "yes")]
+    pub close_to_tray: bool,
 }
 
 fn yes() -> bool {
@@ -39,7 +42,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { cmd_as_ctrl: true, native: false, audio: true, host: true }
+        Self { cmd_as_ctrl: true, native: false, audio: true, host: true, close_to_tray: true }
     }
 }
 

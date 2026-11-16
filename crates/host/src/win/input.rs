@@ -1,6 +1,6 @@
 //! 通过 SendInput 注入键鼠事件。
 
-use crate::source::InputSink;
+use crate::source::{Area, InputSink};
 use rc_protocol::InputEvent;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -13,8 +13,8 @@ const XBUTTON1: u32 = 1;
 const XBUTTON2: u32 = 2;
 
 pub struct Injector {
-    /// 被捕获屏幕在虚拟桌面中的 (left, top, width, height)。
-    rect: (i32, i32, u32, u32),
+    /// 被捕获屏幕在虚拟桌面中的位置（切换显示器时由采集端更新）。
+    area: Area,
     keys_down: HashSet<(u16, bool)>,
     buttons_down: HashSet<u8>,
     last_desktop_check: Instant,
@@ -30,8 +30,8 @@ fn send(inputs: &[INPUT]) {
 }
 
 impl Injector {
-    pub fn new(rect: (i32, i32, u32, u32)) -> Self {
-        Self { rect, keys_down: HashSet::new(), buttons_down: HashSet::new(), last_desktop_check: Instant::now() - Duration::from_secs(1) }
+    pub fn new(area: Area) -> Self {
+        Self { area, keys_down: HashSet::new(), buttons_down: HashSet::new(), last_desktop_check: Instant::now() - Duration::from_secs(1) }
     }
 
     fn mouse(&self, dx: i32, dy: i32, data: u32, flags: MOUSE_EVENT_FLAGS) {
@@ -102,7 +102,10 @@ impl InputSink for Injector {
         }
         match ev {
             InputEvent::MouseMoveAbs { x, y } => {
-                let (left, top, w, h) = self.rect;
+                let (left, top, w, h) = {
+                    let a = *self.area.lock().unwrap();
+                    (a.0 as i32, a.1 as i32, a.2 as u32, a.3 as u32)
+                };
                 let (vx, vy, vw, vh) = unsafe {
                     (
                         GetSystemMetrics(SM_XVIRTUALSCREEN),

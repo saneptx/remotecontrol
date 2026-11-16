@@ -11,7 +11,7 @@ pub mod power;
 mod scale;
 pub mod service;
 
-use crate::source::{encode_size, EncodedFrame, VideoSource};
+use crate::source::{encode_size, Area, EncodedFrame, VideoSource};
 use crate::{now_us, Args};
 use anyhow::{bail, Result};
 use capture::{Capturer, State};
@@ -29,8 +29,8 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    fn open(fps: Option<u32>, bitrate: u32, viewport: (u32, u32)) -> Result<(Self, u32)> {
-        let cap = Capturer::new()?;
+    fn open(display: usize, fps: Option<u32>, bitrate: u32, viewport: (u32, u32)) -> Result<(Self, u32)> {
+        let cap = Capturer::new(display)?;
         let fps = fps.unwrap_or(cap.refresh_hz).clamp(1, 240);
         let (scaler, enc) = Self::make_encoder(&cap, fps, bitrate, viewport)?;
         let mut fence = None;
@@ -98,6 +98,10 @@ pub struct WinSource {
     width: u32,
     height: u32,
     rect: (i32, i32, u32, u32),
+    /// 正在采集的显示器（[`capture::list_outputs`] 的下标）
+    display: usize,
+    /// 与输入注入共享的当前显示器位置
+    area: Area,
     fps: u32,
     /// 两次编码之间的最小间隔（略小于 1/fps，避免和显示器刷新节奏“擦边”而多等一帧）。
     min_interval: Duration,
@@ -153,8 +157,10 @@ impl WinSource {
         // 显示器可能已关闭（甚至从系统中断开）：先唤醒，再给它几秒钟重新出现。
         power::wake_display();
         let deadline = Instant::now() + Duration::from_secs(5);
+        // 默认采集主显示器
+        let display = capture::list_outputs().iter().position(|o| o.primary()).unwrap_or(0);
         let (pipe, fps) = loop {
-            match Pipeline::open(args.fps, args.bitrate, (0, 0)) {
+            match Pipeline::open(display, args.fps, args.bitrate, (0, 0)) {
                 Ok(v) => break v,
                 Err(e) if Instant::now() < deadline => {
                     eprintln!("初始化采集失败，重试中: {e:#}");
@@ -171,6 +177,8 @@ impl WinSource {
             width: cap.width,
             height: cap.height,
             rect: (cap.left, cap.top, cap.width, cap.height),
+            display,
+            area: std::sync::Arc::new(std::sync::Mutex::new((cap.left as f64, cap.top as f64, cap.width as f64, cap.height as f64))),
             inner: Some(pipe),
             fps_arg: args.fps,
             bitrate: args.bitrate,
@@ -188,9 +196,9 @@ impl WinSource {
         })
     }
 
-    /// 被捕获屏幕在虚拟桌面中的位置与尺寸 (left, top, width, height)。
-    pub fn desktop_rect(&self) -> (i32, i32, u32, u32) {
-        self.rect
+    /// 当前显示器的位置，交给输入注入使用（切换显示器时随之更新）。
+    pub fn area(&self) -> Area {
+        self.area.clone()
     }
 
     /// 采集管线失效后定期尝试重建。
@@ -201,7 +209,7 @@ impl WinSource {
         }
         self.last_rebuild = Instant::now();
         power::wake_display();
-        match Pipeline::open(self.fps_arg, self.bitrate, self.viewport) {
+        match Pipeline::open(self.display, self.fps_arg, self.bitrate, self.viewport) {
             Ok((p, _)) => {
                 if (p.cap.width, p.cap.height) != (self.width, self.height) {
                     bail!("屏幕分辨率已变化（{}x{} → {}x{}），请重新连接", self.width, self.height, p.cap.width, p.cap.height);
@@ -247,6 +255,55 @@ impl VideoSource for WinSource {
 
     fn cursor(&mut self) -> Option<rc_protocol::CursorShape> {
         Some(self.cursors.current())
+    }
+
+    fn displays(&self) -> Vec<rc_protocol::DisplayInfo> {
+        capture::list_outputs()
+            .iter()
+            .enumerate()
+            .map(|(i, o)| rc_protocol::DisplayInfo {
+                name: format!("显示器 {}", i + 1),
+                width: o.rect.2,
+                height: o.rect.3,
+                primary: o.primary(),
+            })
+            .collect()
+    }
+
+    fn current_display(&self) -> u32 {
+        self.display as u32
+    }
+
+    fn select_display(&mut self, index: u32) -> Result<()> {
+        let index = index as usize;
+        if index == self.display && self.inner.is_some() {
+            return Ok(());
+        }
+        let outputs = capture::list_outputs();
+        let Some(info) = outputs.get(index) else { bail!("没有第 {} 块显示器", index + 1) };
+        let device = info.device.clone();
+        // 先释放旧管线（编码器、采集），再为新显示器建立
+        self.inner = None;
+        match Pipeline::open(index, self.fps_arg, self.bitrate, self.viewport) {
+            Ok((p, fps)) => {
+                let cap = &p.cap;
+                println!("采集 {device} {}x{} @ {}Hz", cap.width, cap.height, cap.refresh_hz);
+                (self.width, self.height) = (cap.width, cap.height);
+                self.rect = (cap.left, cap.top, cap.width, cap.height);
+                *self.area.lock().unwrap() = (cap.left as f64, cap.top as f64, cap.width as f64, cap.height as f64);
+                self.fps = fps;
+                self.min_interval = Duration::from_secs_f64(0.9 / fps as f64);
+                self.display = index;
+                self.inner = Some(p);
+                self.pending_key = true;
+                self.has_image = false;
+                self.dirty_since = None;
+                self.notice = None;
+                Ok(())
+            }
+            // 新显示器打不开（例如接在集成显卡上，NVENC 用不了）：退回原来那块，由 next_frame 重建
+            Err(e) => bail!("{e:#}"),
+        }
     }
 
     fn set_viewport(&mut self, width: u32, height: u32) -> Result<()> {
