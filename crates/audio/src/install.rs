@@ -121,14 +121,27 @@ mod imp {
         "https://existential.audio/downloads/BlackHole2ch-0.6.1.pkg",
     ];
 
+    /// 已安装的插件（文件在，但音频服务还没加载它时，只需重启音频服务）。
+    const DRIVER: &str = "/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver";
+    /// 重启系统音频服务，让新装的插件生效（会让所有声音中断一两秒）。
+    const RELOAD: &str = "/bin/launchctl kickstart -k system/com.apple.audio.coreaudiod || /usr/bin/killall coreaudiod";
+
     pub fn install(dir: &Path, _elevated: bool) -> Result<()> {
-        let pkg = dir.join("BlackHole2ch.pkg");
-        download(URLS, &pkg)?;
-        // 系统的管理员密码框；安装包的脚本会重启 coreaudiod 让设备出现
-        let script = format!(
-            "do shell script \"/usr/sbin/installer -pkg '{}' -target /\" with administrator privileges with prompt \"SuperControl 要安装虚拟声卡 BlackHole，用来接收对方电脑的麦克风声音。\"",
-            pkg.display().to_string().replace('\'', "'\\''").replace('"', "\\\"")
-        );
+        // BlackHole 0.7 的安装包不会重启 coreaudiod：装完设备不出现。所以安装后自己重启一次，
+        // 和安装放在同一个管理员命令里，只需输入一次密码
+        let (command, prompt) = if Path::new(DRIVER).exists() {
+            (RELOAD.to_string(), "SuperControl 要重新加载系统音频服务，让已安装的虚拟声卡 BlackHole 生效。")
+        } else {
+            let pkg = dir.join("BlackHole2ch.pkg");
+            download(URLS, &pkg)?;
+            let quoted = format!("'{}'", pkg.display().to_string().replace('\'', "'\\''"));
+            (
+                format!("/usr/sbin/installer -pkg {quoted} -target / && {{ {RELOAD}; }}"),
+                "SuperControl 要安装虚拟声卡 BlackHole，用来接收对方电脑的麦克风声音。",
+            )
+        };
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!("do shell script \"{}\" with administrator privileges with prompt \"{}\"", esc(&command), esc(prompt));
         let out = Command::new("/usr/bin/osascript").args(["-e", &script]).output().context("运行 osascript")?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
