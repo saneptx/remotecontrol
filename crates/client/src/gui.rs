@@ -135,6 +135,8 @@ struct CardInfo {
     target: Option<(Option<DeviceId>, SocketAddr, Option<String>)>,
     /// 点“忘记”时删除的配对记录
     forget_id: Option<String>,
+    /// 已经在控制这台电脑（连接按钮不可点）
+    connected: bool,
 }
 
 struct Gui {
@@ -884,6 +886,7 @@ impl Gui {
                 compatible: d.version == proto::PROTOCOL_VERSION,
                 target: Some((Some(d.host_id), d.addr, Some(d.os.clone()))),
                 forget_id: d.paired.then(|| proto::hex(&d.host_id)),
+                connected: self.sessions.iter().any(|s| s.name == d.name),
             })
             .collect();
         for k in config::known_hosts() {
@@ -901,6 +904,7 @@ impl Gui {
                 compatible: true,
                 target: parsed.map(|a| (proto::parse_hex16(&k.id), a, None)),
                 forget_id: Some(k.id.clone()),
+                connected: self.sessions.iter().any(|s| s.name == k.name),
             });
         }
         cards
@@ -1316,17 +1320,26 @@ fn device_card(ui: &mut egui::Ui, c: &CardInfo, width: f32, busy: bool) -> (bool
         });
         ui.add_space(12.0);
         ui.horizontal(|ui| {
-            let enabled = !busy && c.compatible && c.target.is_some();
-            let hint = if !c.compatible {
+            let enabled = !busy && c.compatible && c.target.is_some() && !c.connected;
+            let hint = if c.connected {
+                "已在控制这台电脑，远程画面在独立窗口中"
+            } else if !c.compatible {
                 "两台电脑的 SuperControl 版本不一致，请更新到同一版本"
             } else if !c.online {
                 "对方当前不在线，将按上次的地址尝试连接"
             } else {
                 "打开远程画面"
             };
-            let label = if c.online { "连接" } else { "尝试连接" };
+            let label = if c.connected {
+                "已连接"
+            } else if c.online {
+                "连接"
+            } else {
+                "尝试连接"
+            };
             if kit::primary_button(ui, label, enabled)
                 .on_hover_text(hint)
+                .on_disabled_hover_text(hint)
                 .clicked()
             {
                 connect = true;
