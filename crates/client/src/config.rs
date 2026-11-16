@@ -34,6 +34,12 @@ pub struct Settings {
     /// 关闭主窗口时隐藏到托盘 / 菜单栏，而不是退出
     #[serde(default = "yes")]
     pub close_to_tray: bool,
+    /// 控制时让对方电脑的扬声器静音（声音照样传过来）
+    #[serde(default = "yes")]
+    pub mute_host: bool,
+    /// 把本机麦克风传给对方（对方需要装虚拟声卡）
+    #[serde(default)]
+    pub mic: bool,
 }
 
 fn yes() -> bool {
@@ -42,7 +48,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { cmd_as_ctrl: true, native: false, audio: true, host: true, close_to_tray: true }
+        Self { cmd_as_ctrl: true, native: false, audio: true, host: true, close_to_tray: true, mute_host: true, mic: false }
     }
 }
 

@@ -1,4 +1,4 @@
-//! 声音播放（控制端）：接收被控端的 PCM，经抖动缓冲后从本机默认输出设备播放。
+//! 声音播放：接收对方的 PCM，经抖动缓冲后从本机的输出设备播放。
 //!
 //! 缓冲目标约 30 ms；积压超过 90 ms 时丢掉最旧的部分，延迟不会越攒越大；
 //! 缓冲见底时输出静音并重新攒够目标量再播，避免断断续续的爆音。
@@ -78,9 +78,12 @@ impl Resampler {
     }
 }
 
-/// 开始播放。返回的 Stream 需要一直持有（丢弃即停止）。
-pub fn start(sock: UdpSocket, alive: Arc<AtomicBool>) -> Result<cpal::Stream> {
-    let device = cpal::default_host().default_output_device().context("没有默认的输出设备")?;
+/// 开始播放。`device` 为 None 时用默认输出设备。返回的 Stream 需要一直持有（丢弃即停止）。
+pub fn start(sock: UdpSocket, alive: Arc<AtomicBool>, device: Option<cpal::Device>) -> Result<cpal::Stream> {
+    let device = match device {
+        Some(d) => d,
+        None => cpal::default_host().default_output_device().context("没有默认的输出设备")?,
+    };
     let cfg = device.default_output_config().context("读取输出设备格式")?;
     let (out_rate, out_ch) = (cfg.sample_rate(), cfg.channels() as usize);
     let jitter = Arc::new(Mutex::new(Jitter {

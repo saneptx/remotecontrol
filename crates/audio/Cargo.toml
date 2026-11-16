@@ -1,0 +1,10 @@
+[package]
+name = "rc-audio"
+version.workspace = true
+edition.workspace = true
+description = "声音：抖动缓冲播放、麦克风采集（两端共用）"
+
+[dependencies]
+anyhow.workspace = true
+rc-protocol.workspace = true
+cpal = "0.18"

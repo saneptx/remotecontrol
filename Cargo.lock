@@ -2784,18 +2784,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rc-audio"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cpal",
+ "rc-protocol",
+]
+
+[[package]]
 name = "rc-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "cpal",
  "eframe",
  "embed-resource",
  "if-addrs",
  "objc2 0.6.5",
  "objc2-foundation 0.3.2",
  "png 0.17.16",
+ "rc-audio",
  "rc-macos",
  "rc-protocol",
  "rc-windows",
@@ -2816,6 +2825,7 @@ dependencies = [
  "clap",
  "cpal",
  "libloading",
+ "rc-audio",
  "rc-macos",
  "rc-protocol",
  "rc-windows",
@@ -2824,6 +2834,7 @@ dependencies = [
  "serde_json",
  "socket2",
  "windows 0.61.3",
+ "windows-core 0.61.2",
  "windows-service",
 ]
 

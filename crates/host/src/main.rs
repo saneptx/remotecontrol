@@ -2,6 +2,7 @@
 
 mod audio;
 mod clip;
+mod mute;
 mod source;
 mod trust;
 #[cfg(not(windows))]
@@ -160,6 +161,8 @@ pub fn list_devices() -> Result<()> {
 
 fn run_host(args: Args) -> Result<()> {
     now_us();
+    // 上次会话让扬声器静音后没来得及恢复（崩溃、断电）：先恢复
+    mute::recover();
     #[cfg(unix)]
     if args.exit_with_parent {
         // 界面退出（包括崩溃）后父进程变成 launchd，被控端随之退出
@@ -315,7 +318,7 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
             Err(e) => return Err(e.into()),
         };
     }
-    let ClientMsg::Auth { mac, udp_port, audio_port, codecs } = auth else {
+    let ClientMsg::Auth { mac, udp_port, audio_port, codecs, mute_host, mic } = auth else {
         bail!("握手失败：期望 Auth");
     };
     if !proto::pair::ct_eq(&mac, &proto::pair::client_mac(&key, &nonce, &client_nonce)) {
@@ -364,6 +367,22 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
             Some(s)
         }
     };
+    // 控制端的麦克风：放进虚拟声卡（VB-CABLE / BlackHole），本机软件选它当麦克风即可
+    let mic_sock = if mic {
+        match rc_audio::virtual_cable() {
+            Some((dev, name)) => {
+                let s = UdpSocket::bind("0.0.0.0:0")?;
+                println!("控制端的麦克风将放进「{name}」");
+                Some((s, dev))
+            }
+            None => {
+                println!("控制端要传麦克风，但本机没有虚拟声卡（Windows 装 VB-CABLE，Mac 装 BlackHole）");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let welcome = HostMsg::Welcome {
         width,
         height,
@@ -373,6 +392,7 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
         video_port: udp.local_addr()?.port(),
         audio_port: audio_udp.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port()).unwrap_or(0),
         codec: video_src.codec(),
+        mic_port: mic_sock.as_ref().and_then(|(s, _)| s.local_addr().ok()).map(|a| a.port()).unwrap_or(0),
     };
     proto::write_msg(&mut tcp, &welcome)?;
     // 会话期间保持显示器常亮
@@ -385,6 +405,15 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
     if let Some(a) = audio_udp {
         audio::spawn(a, alive.clone());
     }
+    // 会话结束时（本函数返回）恢复扬声器、停止播放麦克风
+    let _mute = if mute_host { mute::MuteGuard::engage() } else { None };
+    let _mic = mic_sock.and_then(|(s, dev)| match rc_audio::player::start(s, alive.clone(), Some(dev)) {
+        Ok(stream) => Some(stream),
+        Err(e) => {
+            eprintln!("播放控制端麦克风失败: {e:#}");
+            None
+        }
+    });
     // 控制端窗口尺寸，打包成 (w << 32 | h)；NO_VIEWPORT 表示还没收到。
     const NO_VIEWPORT: u64 = u64::MAX;
     let viewport = Arc::new(AtomicU64::new(NO_VIEWPORT));

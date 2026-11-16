@@ -31,6 +31,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSLocalNetworkUsageDescription</key><string>用于发现并连接同一局域网中的电脑。</string>
+    <key>NSMicrophoneUsageDescription</key><string>用于把本机麦克风的声音传给正在控制的电脑（在设置里开启后才会使用）。</string>
 </dict>
 </plist>
 PLIST

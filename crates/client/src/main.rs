@@ -10,7 +10,6 @@ fn main() {
 }
 
 #[cfg(any(target_os = "macos", windows))]
-mod audio;
 #[cfg(target_os = "macos")]
 mod awdl;
 /// Windows 上没有 AWDL
@@ -161,6 +160,12 @@ mod app {
         /// 连接后取回远端剪贴板里的文件（等同于 ⌘⇧D）
         #[arg(long, hide = true)]
         fetch: bool,
+        /// 连接期间不让对方的扬声器静音
+        #[arg(long)]
+        no_mute_host: bool,
+        /// 把本机麦克风传给对方（对方需要装虚拟声卡：VB-CABLE / BlackHole）
+        #[arg(long)]
+        mic: bool,
         /// 指定视频格式（默认 HEVC 优先，本机或对方不支持时用 H.264）
         #[arg(long, value_parser = ["hevc", "h264"])]
         codec: Option<String>,
@@ -220,7 +225,9 @@ mod app {
         wheel_acc: (f64, f64),
         data: Option<crate::datalink::DataLink>,
         /// 声音播放流（丢弃即停止）
-        audio: Option<cpal::Stream>,
+        audio: Option<rc_audio::Stream>,
+        /// 正在发给对方的麦克风
+        mic: Option<rc_audio::Stream>,
         mods: winit::keyboard::ModifiersState,
         /// 被本地快捷键吃掉的按键：抬起时也不发给远端
         swallowed: HashSet<winit::keyboard::KeyCode>,
@@ -240,7 +247,8 @@ mod app {
             anyhow::ensure!(codecs.contains(&want), "本机不支持 {} 解码", want.name());
             codecs = vec![want];
         }
-        let conn = net::connect(addr, !args.no_audio, codecs, |ev| match ev {
+        let opts = net::Options { audio: !args.no_audio, codecs, mute_host: !args.no_mute_host, mic: args.mic };
+        let conn = net::connect(addr, opts, |ev| match ev {
             net::HandshakeEvent::PairCode { host_name, code } => {
                 eprintln!("首次连接「{host_name}」需要配对：请在对方屏幕上确认配对码 {code} 并点“是”");
             }
@@ -265,6 +273,7 @@ mod app {
             wheel_acc: (0.0, 0.0),
             data: None,
             audio: None,
+            mic: None,
             mods: Default::default(),
             swallowed: HashSet::new(),
             displays: Vec::new(),
@@ -308,10 +317,13 @@ mod app {
             let control = net::Control::new(conn.tcp.try_clone()?);
             self.shared.alive.store(true, Ordering::Relaxed);
             if let Some(sock) = conn.audio.take() {
-                match crate::audio::start(sock, Arc::new(std::sync::atomic::AtomicBool::new(true))) {
+                match rc_audio::player::start(sock, Arc::new(std::sync::atomic::AtomicBool::new(true)), None) {
                     Ok(s) => self.audio = Some(s),
                     Err(e) => eprintln!("声音不可用: {e:#}"),
                 }
+            }
+            if self.args.mic {
+                self.start_mic(conn.addr, conn.mic_port);
             }
             // 数据通道失败不影响远程画面，只是没有剪贴板和文件传输
             match crate::datalink::DataLink::open(conn.addr, conn.data_token) {
@@ -395,6 +407,9 @@ mod app {
                 if print_stats {
                     println!("{line}");
                 }
+                if let Some(n) = shared.audio_note.lock().unwrap().as_deref() {
+                    line = format!("{n} · {line}");
+                }
                 let host = match shared.display_label.lock().unwrap().as_deref() {
                     Some(d) => format!("{host} · {d}"),
                     None => host.clone(),
@@ -410,6 +425,28 @@ mod app {
             self.control = Some(control);
             self.send_viewport();
             Ok(())
+        }
+
+        /// 把本机麦克风发给对方（对方放进虚拟声卡）。
+        fn start_mic(&mut self, addr: std::net::SocketAddr, port: u16) {
+            let note = |s: &str| {
+                eprintln!("{s}");
+                *self.shared.audio_note.lock().unwrap() = Some(s.to_string());
+            };
+            if port == 0 {
+                return note("麦克风未传送：对方没有装虚拟声卡（Windows 装 VB-CABLE，Mac 装 BlackHole）");
+            }
+            let started = std::net::UdpSocket::bind("0.0.0.0:0")
+                .and_then(|s| s.connect((addr.ip(), port)).map(|()| s))
+                .map_err(anyhow::Error::from)
+                .and_then(rc_audio::mic::start);
+            match started {
+                Ok((stream, name)) => {
+                    println!("麦克风：正在把「{name}」传给对方");
+                    self.mic = Some(stream);
+                }
+                Err(e) => note(&format!("麦克风不可用：{e:#}")),
+            }
         }
 
         /// 告诉被控端本机窗口的实际像素尺寸，它会按此缩小编码分辨率。

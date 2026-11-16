@@ -1,4 +1,4 @@
-//! 声音采集（被控端）：Windows 上用 WASAPI 环回录下系统正在播放的声音，打包成 PCM 发给控制端。
+//! 声音采集（被控端）：Windows 上用 WASAPI 按进程环回录下各程序正在播放的声音，打包成 PCM 发给控制端。
 //! macOS 上用 ScreenCaptureKit 采集系统声音；测试图像源模式发送 440 Hz 测试音。
 
 use rc_protocol::audio::{self, MAX_FRAMES};
@@ -36,8 +36,144 @@ pub fn spawn(udp: UdpSocket, alive: Arc<AtomicBool>) {
     });
 }
 
+/// Windows：优先用按进程环回采集（Windows 10 2004 起）——采所有程序发出的声音、排除本进程，
+/// 不经过扬声器音量，所以扬声器静音时照样能采到；本进程放进虚拟声卡的麦克风声音也不会被采回去。
+/// 不支持时退回整个播放设备的环回采集。
 #[cfg(windows)]
 fn run(udp: UdpSocket, alive: &AtomicBool) -> anyhow::Result<()> {
+    let udp2 = udp.try_clone()?;
+    match process_loopback::run(udp, alive) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!("按进程采集声音不可用，改为采集整个播放设备（扬声器静音时将没有声音）: {e:#}");
+            run_endpoint(udp2, alive)
+        }
+    }
+}
+
+#[cfg(windows)]
+mod process_loopback {
+    use super::Sender;
+    use anyhow::{bail, Context, Result};
+    use rc_protocol::audio::MAX_FRAMES;
+    use std::net::UdpSocket;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use windows::core::{implement, Interface, Ref};
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::Media::Audio::*;
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::Win32::System::Com::{CoInitializeEx, BLOB, COINIT_MULTITHREADED};
+    use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, WaitForSingleObject};
+    use windows::Win32::System::Variant::VT_BLOB;
+
+    const RATE: u32 = 48_000;
+
+    #[implement(IActivateAudioInterfaceCompletionHandler)]
+    struct Done(mpsc::Sender<()>);
+
+    impl IActivateAudioInterfaceCompletionHandler_Impl for Done_Impl {
+        fn ActivateCompleted(&self, _op: Ref<'_, IActivateAudioInterfaceAsyncOperation>) -> windows::core::Result<()> {
+            let _ = self.0.send(());
+            Ok(())
+        }
+    }
+
+    pub fn run(udp: UdpSocket, alive: &AtomicBool) -> Result<()> {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
+                ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+                Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+                    ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                        TargetProcessId: GetCurrentProcessId(),
+                        ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+                    },
+                },
+            };
+            let mut pv = PROPVARIANT::default();
+            {
+                let inner = &mut pv.Anonymous.Anonymous;
+                inner.vt = VT_BLOB;
+                inner.Anonymous.blob = BLOB {
+                    cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+                    pBlobData: &mut params as *mut _ as *mut u8,
+                };
+            }
+            let (tx, rx) = mpsc::channel();
+            let handler: IActivateAudioInterfaceCompletionHandler = Done(tx).into();
+            let op = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, &IAudioClient::IID, Some(&pv), &handler)
+                .context("ActivateAudioInterfaceAsync")?;
+            rx.recv_timeout(std::time::Duration::from_secs(5)).context("等待激活超时")?;
+            let mut hr = windows::core::HRESULT(0);
+            let mut unk = None;
+            op.GetActivateResult(&mut hr, &mut unk)?;
+            hr.ok().context("激活按进程环回")?;
+            let client: IAudioClient = unk.context("没有返回 IAudioClient")?.cast()?;
+            // 按进程环回不能查询混音格式，必须自己指定：48 kHz 立体声 16 位
+            let fmt = WAVEFORMATEX {
+                wFormatTag: 1,
+                nChannels: 2,
+                nSamplesPerSec: RATE,
+                nAvgBytesPerSec: RATE * 4,
+                nBlockAlign: 4,
+                wBitsPerSample: 16,
+                cbSize: 0,
+            };
+            client
+                .Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+                    200_000, // 20 ms
+                    0,
+                    &fmt,
+                    None,
+                )
+                .context("IAudioClient::Initialize")?;
+            let event = CreateEventW(None, false, false, None)?;
+            client.SetEventHandle(event)?;
+            let cap: IAudioCaptureClient = client.GetService()?;
+            client.Start()?;
+            println!("声音：按进程环回采集 {RATE} Hz，2 声道（不受扬声器静音影响）");
+            let mut sender = Sender { udp, rate: RATE, seq: 0, pending: Vec::with_capacity(MAX_FRAMES * 4) };
+            let result = (|| -> Result<()> {
+                while alive.load(Ordering::Relaxed) {
+                    // 没有声音时不会有事件，超时后再看看会话是否结束
+                    if WaitForSingleObject(event, 200) != WAIT_OBJECT_0 {
+                        continue;
+                    }
+                    loop {
+                        if cap.GetNextPacketSize()? == 0 {
+                            break;
+                        }
+                        let (mut data, mut frames, mut flags) = (std::ptr::null_mut(), 0u32, 0u32);
+                        cap.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
+                        let n = frames as usize * 2;
+                        if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null() {
+                            sender.push(std::iter::repeat_n(0i16, n));
+                        } else {
+                            sender.push(std::slice::from_raw_parts(data as *const i16, n).iter().copied());
+                        }
+                        cap.ReleaseBuffer(frames)?;
+                    }
+                }
+                Ok(())
+            })();
+            let _ = client.Stop();
+            let _ = CloseHandle(event);
+            if result.is_err() && !alive.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            if let Err(e) = result {
+                bail!("采集中断: {e:#}");
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run_endpoint(udp: UdpSocket, alive: &AtomicBool) -> anyhow::Result<()> {
     use anyhow::Context;
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::SampleFormat;

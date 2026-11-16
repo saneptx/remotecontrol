@@ -1069,6 +1069,22 @@ impl Gui {
             kit::divider(ui);
             kit::setting_row(
                 ui,
+                "控制时让对方静音",
+                "对方电脑的扬声器在连接期间静音，断开后恢复；声音照样传到本机",
+                60.0,
+                |ui| changed |= ui.add(Toggle(&mut self.settings.mute_host)).changed(),
+            );
+            kit::divider(ui);
+            kit::setting_row(
+                ui,
+                "把本机麦克风传给对方",
+                "对方的软件（会议、语音）可以把它当麦克风用。需要对方装虚拟声卡：Windows 装 VB-CABLE，Mac 装 BlackHole",
+                60.0,
+                |ui| changed |= ui.add(Toggle(&mut self.settings.mic)).changed(),
+            );
+            kit::divider(ui);
+            kit::setting_row(
+                ui,
                 "按原始分辨率传输",
                 "默认按窗口大小编码：看起来一样清晰，延迟和带宽更低",
                 60.0,
@@ -1533,6 +1549,12 @@ fn spawn_viewer(
     }
     if settings.native {
         cmd.arg("--native");
+    }
+    if !settings.mute_host {
+        cmd.arg("--no-mute-host");
+    }
+    if settings.mic {
+        cmd.arg("--mic");
     }
     if !settings.audio {
         cmd.arg("--no-audio");

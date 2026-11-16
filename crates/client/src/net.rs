@@ -23,6 +23,8 @@ pub struct Connection {
     pub fps: u32,
     /// 被控端选定的视频格式
     pub codec: proto::Codec,
+    /// 把麦克风声音发到被控端的这个 UDP 端口；0 表示对方没有虚拟声卡或没请求
+    pub mic_port: u16,
     pub host_name: String,
     pub addr: SocketAddr,
     /// 打开数据通道（剪贴板、文件）用的凭据
@@ -44,22 +46,31 @@ pub fn parse_addr(host: &str) -> Result<SocketAddr> {
 
 /// 只做配对（已配对则直接返回）：拿到配对密钥并确认对方接受后立即断开，不打开远程画面。
 pub fn pair(addr: SocketAddr, on_event: impl FnMut(HandshakeEvent)) -> Result<()> {
-    handshake(addr, on_event, true, false, Vec::new()).map(|_| ())
+    handshake(addr, on_event, true, None).map(|_| ())
 }
 
 /// 连接并完成握手。未配对时会发起配对：`on_event` 收到配对码，用户需要在被控端点“允许”。
-/// `codecs`：本机能解码的视频格式，按优先顺序。
-pub fn connect(addr: SocketAddr, want_audio: bool, codecs: Vec<proto::Codec>, on_event: impl FnMut(HandshakeEvent)) -> Result<Connection> {
-    handshake(addr, on_event, false, want_audio, codecs)?.context("握手未完成")
+/// 连接选项。
+pub struct Options {
+    pub audio: bool,
+    /// 本机能解码的视频格式，按优先顺序
+    pub codecs: Vec<proto::Codec>,
+    pub mute_host: bool,
+    pub mic: bool,
+}
+
+pub fn connect(addr: SocketAddr, opts: Options, on_event: impl FnMut(HandshakeEvent)) -> Result<Connection> {
+    handshake(addr, on_event, false, Some(opts))?.context("握手未完成")
 }
 
 fn handshake(
     addr: SocketAddr,
     mut on_event: impl FnMut(HandshakeEvent),
     pair_only: bool,
-    want_audio: bool,
-    codecs: Vec<proto::Codec>,
+    opts: Option<Options>,
 ) -> Result<Option<Connection>> {
+    let opts = opts.unwrap_or(Options { audio: false, codecs: Vec::new(), mute_host: false, mic: false });
+    let want_audio = opts.audio;
     let device_id = config::device_id()?;
     let mut tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).with_context(|| format!("连接 {addr} 失败"))?;
     tcp.set_nodelay(true)?;
@@ -123,9 +134,16 @@ fn handshake(
     let mac = proto::pair::client_mac(&key, &host_nonce, &client_nonce);
     let audio = if want_audio { UdpSocket::bind("0.0.0.0:0").ok() } else { None };
     let audio_port = audio.as_ref().and_then(|a| a.local_addr().ok()).map(|a| a.port()).unwrap_or(0);
-    proto::write_msg(&mut tcp, &ClientMsg::Auth { mac, udp_port: udp.local_addr()?.port(), audio_port, codecs })?;
+    proto::write_msg(&mut tcp, &ClientMsg::Auth {
+        mac,
+        udp_port: udp.local_addr()?.port(),
+        audio_port,
+        codecs: opts.codecs,
+        mute_host: opts.mute_host,
+        mic: opts.mic,
+    })?;
     match proto::read_msg(&mut tcp)? {
-        HostMsg::Welcome { width, height, fps, host_proof, data_token, video_port, audio_port, codec } => {
+        HostMsg::Welcome { width, height, fps, host_proof, data_token, video_port, audio_port, codec, mic_port } => {
             if !proto::pair::ct_eq(&host_proof, &proto::pair::host_proof(&key, &host_nonce, &client_nonce)) {
                 bail!("被控端身份验证失败：对方不是配对时的那台机器（可能被冒充），已中止连接");
             }
@@ -141,7 +159,7 @@ fn handshake(
                     spawn_punch(a, SocketAddr::new(addr.ip(), audio_port));
                 }
             }
-            Ok(Some(Connection { tcp, udp, width, height, fps, codec, host_name, addr, data_token, audio }))
+            Ok(Some(Connection { tcp, udp, width, height, fps, codec, mic_port, host_name, addr, data_token, audio }))
         }
         HostMsg::Reject { reason } => bail!("被控端拒绝连接: {reason}"),
         other => bail!("握手失败: {other:?}"),
@@ -257,6 +275,8 @@ pub struct Shared {
     pub notice: Mutex<Option<String>>,
     /// 被控端有多块显示器时，当前显示的是哪一块（显示在窗口标题里）。
     pub display_label: Mutex<Option<String>>,
+    /// 声音相关的提示（例如麦克风传不过去的原因），显示在窗口标题里。
+    pub audio_note: Mutex<Option<String>>,
 }
 
 /// 读控制通道：处理 Pong 估算时钟差；连接断开时调用 `on_closed`。

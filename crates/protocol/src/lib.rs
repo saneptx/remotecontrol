@@ -18,7 +18,7 @@ pub mod video;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const DEFAULT_PORT: u16 = 47800;
 /// 局域网发现使用的 UDP 端口。
 pub const DISCOVERY_PORT: u16 = 47801;
@@ -66,7 +66,9 @@ pub enum ClientMsg {
     /// `mac` 见 [`pair::client_mac`]；`udp_port` 为控制端接收视频的端口；
     /// `audio_port` 为接收声音的端口（0 表示不要声音）。
     /// `codecs`：控制端能解码的视频格式，按优先顺序排列；被控端选第一个自己能编码的。
-    Auth { mac: [u8; 32], udp_port: u16, audio_port: u16, codecs: Vec<Codec> },
+    /// `mute_host`：会话期间让被控端的扬声器静音（声音照样传给控制端）。
+    /// `mic`：控制端要把麦克风声音传过来（被控端放进虚拟声卡，供它上面的软件当麦克风用）。
+    Auth { mac: [u8; 32], udp_port: u16, audio_port: u16, codecs: Vec<Codec>, mute_host: bool, mic: bool },
     Input(InputEvent),
     RequestKeyframe,
     Ping { t_us: u64 },
@@ -87,7 +89,18 @@ pub enum HostMsg {
     /// `video_port` / `audio_port` 是被控端发送视频、声音所用的 UDP 端口：控制端先从自己的接收端口
     /// 往这里发小包（UDP 打洞），本机防火墙就会把对方发来的数据当作回复放行，无需添加防火墙规则。
     /// `codec` 为被控端选定的视频格式（整个会话不变）。
-    Welcome { width: u32, height: u32, fps: u32, host_proof: [u8; 32], data_token: [u8; 16], video_port: u16, audio_port: u16, codec: Codec },
+    /// `mic_port`：控制端把麦克风声音发到这个 UDP 端口；0 表示被控端没有虚拟声卡（或没有请求）。
+    Welcome {
+        width: u32,
+        height: u32,
+        fps: u32,
+        host_proof: [u8; 32],
+        data_token: [u8; 16],
+        video_port: u16,
+        audio_port: u16,
+        codec: Codec,
+        mic_port: u16,
+    },
     Reject { reason: String },
     /// `t_us` 原样返回，`host_us` 为被控端时钟，用于估算两端时钟差。
     Pong { t_us: u64, host_us: u64 },
