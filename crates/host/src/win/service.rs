@@ -592,7 +592,7 @@ pub fn install(args: &Args) -> Result<()> {
     println!("确认后该设备以后可以直接连接。锁屏、登录界面和 UAC 弹窗也能看到并操作。");
     println!("提示：如果之前手动运行的 rc-host 还开着，请先关掉它，否则端口会冲突。");
     println!("修改参数：重新执行 install 并带上新参数；查看/删除已配对设备：rc-host devices / rc-host forget <名称>；卸载：rc-host uninstall");
-    println!("连不上时运行 rc-host status（或双击 diagnose.cmd）检查问题。");
+    println!("连不上时在管理员终端运行 rc-host status 检查问题。");
     if !public.is_empty() {
         println!();
         println!("⚠️  注意：网络「{}」当前是“公用网络”。", public.join("、"));
@@ -712,7 +712,7 @@ pub fn status() -> Result<()> {
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            println!("（需要管理员权限才能查看，请双击 diagnose.cmd）");
+            println!("（需要管理员权限才能查看，请在管理员终端运行 rc-host status）");
         }
         Err(_) => println!("（暂无日志）"),
     }
