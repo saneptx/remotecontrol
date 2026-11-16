@@ -161,6 +161,9 @@ mod app {
         /// 连接后取回远端剪贴板里的文件（等同于 ⌘⇧D）
         #[arg(long, hide = true)]
         fetch: bool,
+        /// 指定视频格式（默认 HEVC 优先，本机或对方不支持时用 H.264）
+        #[arg(long, value_parser = ["hevc", "h264"])]
+        codec: Option<String>,
     }
 
     /// 取回远端复制的文件的快捷键（显示用）。
@@ -229,12 +232,18 @@ mod app {
         #[cfg(target_os = "macos")]
         let _activity = begin_latency_critical_activity();
         let addr = net::parse_addr(&args.host)?;
-        let conn = net::connect(addr, !args.no_audio, |ev| match ev {
+        let mut codecs = crate::display::supported_codecs();
+        if let Some(c) = &args.codec {
+            let want = if c == "h264" { rc_protocol::Codec::H264 } else { rc_protocol::Codec::Hevc };
+            anyhow::ensure!(codecs.contains(&want), "本机不支持 {} 解码", want.name());
+            codecs = vec![want];
+        }
+        let conn = net::connect(addr, !args.no_audio, codecs, |ev| match ev {
             net::HandshakeEvent::PairCode { host_name, code } => {
                 eprintln!("首次连接「{host_name}」需要配对：请在对方屏幕上确认配对码 {code} 并点“是”");
             }
         })?;
-        println!("已连接「{}」，远端画面 {}x{} @ {}fps", conn.host_name, conn.width, conn.height, conn.fps);
+        println!("已连接「{}」，远端画面 {}x{} @ {}fps，{}", conn.host_name, conn.width, conn.height, conn.fps, conn.codec.name());
 
         let event_loop = EventLoop::<UserEvent>::with_user_event()
             // 不要默认菜单：否则 Cmd+Q / Cmd+W / Cmd+H 会被本地菜单吃掉，发不到远端。
@@ -286,9 +295,9 @@ mod app {
 
             let sink = match window.window_handle()?.as_raw() {
                 #[cfg(target_os = "macos")]
-                RawWindowHandle::AppKit(h) => unsafe { VideoSink::attach(h.ns_view.as_ptr())? },
+                RawWindowHandle::AppKit(h) => unsafe { VideoSink::attach(h.ns_view.as_ptr(), conn.codec)? },
                 #[cfg(windows)]
-                RawWindowHandle::Win32(h) => unsafe { VideoSink::attach(h.hwnd.get() as *mut std::ffi::c_void)? },
+                RawWindowHandle::Win32(h) => unsafe { VideoSink::attach(h.hwnd.get() as *mut std::ffi::c_void, conn.codec)? },
                 _ => anyhow::bail!("不支持的窗口类型"),
             };
 

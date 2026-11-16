@@ -1,4 +1,4 @@
-//! 解码与显示：把 HEVC 访问单元包装成 CMSampleBuffer，交给 AVSampleBufferDisplayLayer。
+//! 解码与显示：把 HEVC / H.264 访问单元包装成 CMSampleBuffer，交给 AVSampleBufferDisplayLayer。
 //!
 //! 该图层内部用 VideoToolbox 硬件解码并直接上屏（含色彩管理），每个样本都标记
 //! DisplayImmediately，解完即显示，不做任何缓冲/时间戳同步。
@@ -9,7 +9,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject};
 use objc2::msg_send;
 use objc2_foundation::NSRect;
-use rc_protocol::hevc;
+use rc_protocol::{h264, hevc, Codec};
 use std::ffi::{c_int, c_void};
 use std::ptr::{null, null_mut};
 
@@ -71,6 +71,14 @@ extern "C" {
         extensions: CFTypeRef,
         out: *mut CFTypeRef,
     ) -> OSStatus;
+    fn CMVideoFormatDescriptionCreateFromH264ParameterSets(
+        allocator: CFTypeRef,
+        count: usize,
+        pointers: *const *const u8,
+        sizes: *const usize,
+        nal_unit_header_length: c_int,
+        out: *mut CFTypeRef,
+    ) -> OSStatus;
     fn CMBlockBufferCreateWithMemoryBlock(
         allocator: CFTypeRef,
         memory_block: *mut c_void,
@@ -107,11 +115,17 @@ const AV_STATUS_FAILED: isize = 2;
 const CA_LAYER_WIDTH_SIZABLE: u32 = 1 << 1;
 const CA_LAYER_HEIGHT_SIZABLE: u32 = 1 << 4;
 
+/// 本机能解码的格式（VideoToolbox 两种都支持），按优先顺序。
+pub fn supported_codecs() -> Vec<Codec> {
+    vec![Codec::Hevc, Codec::H264]
+}
+
 pub struct VideoSink {
     layer: Retained<AnyObject>,
+    codec: Codec,
     format: CFTypeRef,
-    /// 当前格式描述对应的 VPS/SPS/PPS，变化时（例如分辨率变了）重建格式描述。
-    params: [Vec<u8>; 3],
+    /// 当前格式描述对应的参数集（HEVC：VPS/SPS/PPS；H.264：SPS/PPS），变化时（例如分辨率变了）重建格式描述。
+    params: Vec<Vec<u8>>,
     scratch: Vec<u8>,
 }
 
@@ -123,7 +137,7 @@ impl VideoSink {
     ///
     /// # Safety
     /// `ns_view` 必须是有效的 NSView 指针。
-    pub unsafe fn attach(ns_view: *mut c_void) -> Result<Self> {
+    pub unsafe fn attach(ns_view: *mut c_void, codec: Codec) -> Result<Self> {
         let view = ns_view as *mut AnyObject;
         let Some(cls) = AnyClass::get(c"AVSampleBufferDisplayLayer") else {
             bail!("找不到 AVSampleBufferDisplayLayer");
@@ -143,33 +157,47 @@ impl VideoSink {
         // videoGravity 默认即 ResizeAspect：等比缩放、留黑边。
         let _: () = msg_send![root, addSublayer: &*layer];
 
-        Ok(Self { layer, format: null(), params: Default::default(), scratch: Vec::new() })
+        Ok(Self { layer, codec, format: null(), params: Vec::new(), scratch: Vec::new() })
     }
 
     /// 提交一个访问单元。返回 `false` 表示无法解码（缺参数集或解码器出错），调用方应请求关键帧。
     pub fn push(&mut self, au: &[u8]) -> bool {
-        // 1. 收集参数集；2. 其余需要送解码器的 NAL 转成 4 字节长度前缀（hvcC 格式）。
+        // 1. 收集参数集；2. 其余需要送解码器的 NAL 转成 4 字节长度前缀（hvcC / avcC 格式）。
         let mut new_params: [Option<&[u8]>; 3] = [None; 3];
         self.scratch.clear();
         for nal in hevc::nals(au) {
-            let t = hevc::nal_type(nal);
-            match t {
-                hevc::NAL_VPS => new_params[0] = Some(nal),
-                hevc::NAL_SPS => new_params[1] = Some(nal),
-                hevc::NAL_PPS => new_params[2] = Some(nal),
-                // 切片数据，以及前/后缀 SEI
-                _ if hevc::is_vcl(t) || t == 39 || t == 40 => {
+            // 参数集下标；或者 None 表示切片 / SEI（送解码器），或 Some(None) 表示丢弃
+            let slot = match self.codec {
+                Codec::Hevc => match hevc::nal_type(nal) {
+                    hevc::NAL_VPS => Some(Some(0)),
+                    hevc::NAL_SPS => Some(Some(1)),
+                    hevc::NAL_PPS => Some(Some(2)),
+                    // 切片数据，以及前/后缀 SEI
+                    t if hevc::is_vcl(t) || t == 39 || t == 40 => None,
+                    _ => Some(None),
+                },
+                Codec::H264 => match h264::nal_type(nal) {
+                    h264::NAL_SPS => Some(Some(0)),
+                    h264::NAL_PPS => Some(Some(1)),
+                    t if h264::is_vcl(t) || t == h264::NAL_SEI => None,
+                    _ => Some(None),
+                },
+            };
+            match slot {
+                Some(Some(i)) => new_params[i] = Some(nal),
+                Some(None) => {}
+                None => {
                     self.scratch.extend_from_slice(&(nal.len() as u32).to_be_bytes());
                     self.scratch.extend_from_slice(nal);
                 }
-                _ => {}
             }
         }
-        if let [Some(vps), Some(sps), Some(pps)] = new_params {
-            if self.format.is_null() || [vps, sps, pps] != [&self.params[0][..], &self.params[1][..], &self.params[2][..]] {
-                if !self.set_format(vps, sps, pps) {
-                    return false;
-                }
+        let count = if self.codec == Codec::Hevc { 3 } else { 2 };
+        let found: Option<Vec<&[u8]>> = new_params[..count].iter().copied().collect();
+        if let Some(params) = found {
+            let same = self.params.len() == params.len() && self.params.iter().zip(&params).all(|(a, b)| a[..] == b[..]);
+            if (self.format.is_null() || !same) && !self.set_format(&params) {
+                return false;
             }
         }
         if self.format.is_null() || self.scratch.is_empty() {
@@ -182,7 +210,7 @@ impl VideoSink {
             if failed == AV_STATUS_FAILED || needs_flush {
                 let _: () = msg_send![&*self.layer, flush];
                 // flush 之后必须从关键帧重新开始
-                if !hevc::contains_irap(au) {
+                if !self.codec.is_keyframe(au) {
                     return false;
                 }
             }
@@ -211,11 +239,16 @@ impl VideoSink {
         true
     }
 
-    fn set_format(&mut self, vps: &[u8], sps: &[u8], pps: &[u8]) -> bool {
-        let pointers = [vps.as_ptr(), sps.as_ptr(), pps.as_ptr()];
-        let sizes = [vps.len(), sps.len(), pps.len()];
+    fn set_format(&mut self, params: &[&[u8]]) -> bool {
+        let pointers: Vec<*const u8> = params.iter().map(|p| p.as_ptr()).collect();
+        let sizes: Vec<usize> = params.iter().map(|p| p.len()).collect();
         let mut format: CFTypeRef = null();
-        let status = unsafe { CMVideoFormatDescriptionCreateFromHEVCParameterSets(null(), 3, pointers.as_ptr(), sizes.as_ptr(), 4, null(), &mut format) };
+        let status = unsafe {
+            match self.codec {
+                Codec::Hevc => CMVideoFormatDescriptionCreateFromHEVCParameterSets(null(), params.len(), pointers.as_ptr(), sizes.as_ptr(), 4, null(), &mut format),
+                Codec::H264 => CMVideoFormatDescriptionCreateFromH264ParameterSets(null(), params.len(), pointers.as_ptr(), sizes.as_ptr(), 4, &mut format),
+            }
+        };
         if status != 0 || format.is_null() {
             eprintln!("创建视频格式描述失败: {status}");
             return false;
@@ -224,7 +257,7 @@ impl VideoSink {
             unsafe { CFRelease(self.format) };
         }
         self.format = format;
-        self.params = [vps.to_vec(), sps.to_vec(), pps.to_vec()];
+        self.params = params.iter().map(|p| p.to_vec()).collect();
         true
     }
 }

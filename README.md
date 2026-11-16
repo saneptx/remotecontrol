@@ -6,7 +6,7 @@
 | | 实现 |
 |---|---|
 | 采集 | DXGI Desktop Duplication（画面无变化时不发送任何数据） |
-| 编码 | HEVC 4:2:0（Windows：优先 NVENC，没有 NVIDIA 显卡时用系统的硬件编码器，即 Intel Quick Sync / AMD VCN 的 Media Foundation 编码器；Mac：VideoToolbox），超低延迟设置，无 B 帧，CBR + 单帧 VBV，显存内零拷贝；按控制端窗口的实际像素尺寸在显卡上缩小后再编码 |
+| 编码 | 默认 HEVC 4:2:0，控制端解不了 HEVC 时（Windows 没装“HEVC 视频扩展”）自动改用 H.264；连接时双方协商。被控端编码器（Windows：优先 NVENC，没有 NVIDIA 显卡时用系统的硬件编码器，即 Intel Quick Sync / AMD VCN 的 Media Foundation 编码器；Mac：VideoToolbox），超低延迟设置，无 B 帧，CBR + 单帧 VBV，显存内零拷贝；按控制端窗口的实际像素尺寸在显卡上缩小后再编码 |
 | 传输 | 视频走 UDP（≤1400 字节分片 + Reed-Solomon 前向纠错，零星丢包直接还原，不重传）；控制走 TCP_NODELAY |
 | 解码显示 | VideoToolbox 硬解 + AVSampleBufferDisplayLayer，解完立即上屏，不缓冲 |
 | 输入 | 绝对坐标鼠标、滚轮、扫描码键盘，经 SendInput 注入；本地光标跟随被控端的光标形状（箭头、I 形、手指、调整大小等） |

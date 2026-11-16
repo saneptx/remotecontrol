@@ -5,7 +5,7 @@ use rc_protocol::InputEvent;
 /// 切换显示器时由采集端更新，注入端每次移动鼠标时读取。
 pub type Area = std::sync::Arc<std::sync::Mutex<(f64, f64, f64, f64)>>;
 
-/// 一帧已编码的 HEVC Annex-B 访问单元。
+/// 一帧已编码的 Annex-B 访问单元（格式见 [`VideoSource::codec`]）。
 pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub keyframe: bool,
@@ -16,6 +16,10 @@ pub struct EncodedFrame {
 pub trait VideoSource {
     fn size(&self) -> (u32, u32);
     fn fps(&self) -> u32;
+    /// 输出的视频格式（会话期间不变）。
+    fn codec(&self) -> rc_protocol::Codec {
+        rc_protocol::Codec::Hevc
+    }
     /// 需要告知控制端的状态（例如处于锁屏、无法采集）。
     fn notice(&self) -> Option<String> {
         None

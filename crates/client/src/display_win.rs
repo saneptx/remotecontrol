@@ -1,11 +1,12 @@
-//! Windows 解码与显示：Media Foundation 硬件解码 HEVC（解码结果留在显存里的 D3D11 纹理），
+//! Windows 解码与显示：Media Foundation 硬件解码 HEVC / H.264（解码结果留在显存里的 D3D11 纹理），
 //! 再用 D3D11 视频处理器把 YUV 转成 RGB、等比缩放并加黑边，直接画到窗口的交换链上。全程不经过 CPU 拷贝。
 //!
-//! HEVC 解码依赖系统的“HEVC 视频扩展”（Microsoft Store，很多电脑已预装）。
+//! HEVC 解码依赖系统的“HEVC 视频扩展”（Microsoft Store，很多电脑已预装）；没有时改用系统自带的 H.264 解码器。
 //!
 //! 所有 COM / D3D 对象都在第一次 `push` 时、在视频接收线程里创建，之后也只在这个线程使用。
 
 use anyhow::{bail, Context, Result};
+use rc_protocol::Codec;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use windows::core::Interface;
@@ -35,8 +36,33 @@ struct Pipeline {
     debug: Option<(std::time::Instant, u32)>,
 }
 
+/// 本机能解码的格式，按优先顺序：装了 HEVC 视频扩展时 HEVC 优先，H.264 系统自带。
+pub fn supported_codecs() -> Vec<Codec> {
+    // 在单独的线程里探测：主线程之后要给窗口初始化 OLE（单线程套间），不能先被设成多线程 COM
+    let hevc = std::thread::spawn(|| unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        MFStartup(MF_VERSION, MFSTARTUP_FULL).is_ok() && find_decoder(Codec::Hevc).is_ok()
+    })
+    .join()
+    .unwrap_or(false);
+    if hevc {
+        vec![Codec::Hevc, Codec::H264]
+    } else {
+        eprintln!("本机没有 HEVC 解码器（未安装“HEVC 视频扩展”），改用 H.264");
+        vec![Codec::H264]
+    }
+}
+
+fn subtype(codec: Codec) -> windows::core::GUID {
+    match codec {
+        Codec::Hevc => MFVideoFormat_HEVC,
+        Codec::H264 => MFVideoFormat_H264,
+    }
+}
+
 pub struct VideoSink {
     hwnd: isize,
+    codec: Codec,
     pipe: Option<Pipeline>,
     failed: bool,
 }
@@ -46,14 +72,14 @@ unsafe impl Send for VideoSink {}
 impl VideoSink {
     /// # Safety
     /// `hwnd` 必须是有效的窗口句柄。
-    pub unsafe fn attach(hwnd: *mut c_void) -> Result<Self> {
-        Ok(Self { hwnd: hwnd as isize, pipe: None, failed: false })
+    pub unsafe fn attach(hwnd: *mut c_void, codec: Codec) -> Result<Self> {
+        Ok(Self { hwnd: hwnd as isize, codec, pipe: None, failed: false })
     }
 
     /// 提交一个访问单元。返回 `false` 表示无法解码（调用方会请求关键帧）。
     pub fn push(&mut self, au: &[u8]) -> bool {
         if self.pipe.is_none() && !self.failed {
-            match unsafe { Pipeline::new(HWND(self.hwnd as *mut c_void)) } {
+            match unsafe { Pipeline::new(HWND(self.hwnd as *mut c_void), self.codec) } {
                 Ok(p) => self.pipe = Some(p),
                 Err(e) => {
                     eprintln!("无法初始化视频解码: {e:#}");
@@ -72,9 +98,9 @@ impl VideoSink {
     }
 }
 
-/// 找一个同步的 HEVC 解码 MFT（系统的 HEVC 视频扩展）。
-unsafe fn find_decoder() -> Result<IMFTransform> {
-    let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_HEVC };
+/// 找一个同步的解码 MFT（HEVC 来自系统的 HEVC 视频扩展；H.264 系统自带）。
+unsafe fn find_decoder(codec: Codec) -> Result<IMFTransform> {
+    let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: subtype(codec) };
     for flags in [MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_ALL] {
         let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
         let mut count = 0u32;
@@ -102,7 +128,10 @@ unsafe fn find_decoder() -> Result<IMFTransform> {
             return Ok(t);
         }
     }
-    bail!("没有可用的 HEVC 解码器，请在 Microsoft Store 安装“HEVC 视频扩展”")
+    match codec {
+        Codec::Hevc => bail!("没有可用的 HEVC 解码器，请在 Microsoft Store 安装“HEVC 视频扩展”"),
+        Codec::H264 => bail!("没有可用的 H.264 解码器"),
+    }
 }
 
 fn frame_size(t: &IMFMediaType) -> Option<(u32, u32)> {
@@ -121,7 +150,7 @@ fn visible_size(t: &IMFMediaType) -> Option<(u32, u32)> {
 }
 
 impl Pipeline {
-    unsafe fn new(hwnd: HWND) -> Result<Self> {
+    unsafe fn new(hwnd: HWND, codec: Codec) -> Result<Self> {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         MFStartup(MF_VERSION, MFSTARTUP_FULL).context("MFStartup")?;
 
@@ -165,7 +194,7 @@ impl Pipeline {
         };
         let swap = factory.CreateSwapChainForHwnd(&device, hwnd, &desc, None, None).context("CreateSwapChainForHwnd")?;
 
-        let decoder = find_decoder()?;
+        let decoder = find_decoder(codec)?;
         if let Ok(attrs) = decoder.GetAttributes() {
             let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1); // 解出一帧马上输出，不攒帧
         }
@@ -173,7 +202,7 @@ impl Pipeline {
 
         let input = MFCreateMediaType()?;
         input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-        input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_HEVC)?;
+        input.SetGUID(&MF_MT_SUBTYPE, &subtype(codec))?;
         // 实际尺寸以码流里的 SPS 为准（解码器会发出格式变化）
         input.SetUINT64(&MF_MT_FRAME_SIZE, (1920u64 << 32) | 1080)?;
         input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;

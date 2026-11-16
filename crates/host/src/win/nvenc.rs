@@ -1,10 +1,11 @@
-//! NVENC HEVC 4:2:0（Main）超低延迟编码。输入是已注册的 D3D11 BGRA 纹理，输出 Annex-B 码流。
+//! NVENC 超低延迟编码（HEVC Main 4:2:0，或 H.264 High 备选）。输入是已注册的 D3D11 BGRA 纹理，输出 Annex-B 码流。
 //!
 //! 配置要点：P1 预设 + ULTRA_LOW_LATENCY 调优、无 B 帧、无限 GOP（只在请求时出 IDR）、
 //! CBR 且 VBV 只有一帧大小——每帧大小稳定，网络侧不会出现突发排队。
 
 use crate::nvenc_sys::*;
 use anyhow::{anyhow, bail, Context, Result};
+use rc_protocol::Codec;
 use std::ffi::c_void;
 use std::ptr::null_mut;
 use windows::core::Interface;
@@ -36,7 +37,7 @@ fn check(status: NVENCSTATUS, what: &str) -> Result<()> {
 }
 
 impl Encoder {
-    pub fn new(device: &ID3D11Device, texture: &ID3D11Texture2D, width: u32, height: u32, fps: u32, bitrate_mbps: u32) -> Result<Self> {
+    pub fn new(device: &ID3D11Device, texture: &ID3D11Texture2D, width: u32, height: u32, fps: u32, bitrate_mbps: u32, codec: Codec) -> Result<Self> {
         unsafe {
             let lib = libloading::Library::new("nvEncodeAPI64.dll").context("加载 nvEncodeAPI64.dll 失败（需要 NVIDIA 显卡及驱动）")?;
 
@@ -78,13 +79,17 @@ impl Encoder {
                 _device: device.clone(),
                 _lib: lib,
             };
-            this.init(texture, fps, bitrate_mbps)?;
+            this.init(texture, fps, bitrate_mbps, codec)?;
             Ok(this)
         }
     }
 
-    unsafe fn init(&mut self, texture: &ID3D11Texture2D, fps: u32, bitrate_mbps: u32) -> Result<()> {
+    unsafe fn init(&mut self, texture: &ID3D11Texture2D, fps: u32, bitrate_mbps: u32, codec: Codec) -> Result<()> {
         let api = &self.api;
+        let (codec_guid, profile) = match codec {
+            Codec::Hevc => (NV_ENC_CODEC_HEVC_GUID, NV_ENC_HEVC_PROFILE_MAIN_GUID),
+            Codec::H264 => (NV_ENC_CODEC_H264_GUID, NV_ENC_H264_PROFILE_HIGH_GUID),
+        };
         let preset = NV_ENC_PRESET_P1_GUID;
         let tuning = NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
 
@@ -93,14 +98,14 @@ impl Encoder {
         preset_cfg.version = NV_ENC_PRESET_CONFIG_VER;
         preset_cfg.presetCfg.version = NV_ENC_CONFIG_VER;
         check(
-            api.nvEncGetEncodePresetConfigEx.context("nvEncGetEncodePresetConfigEx")?(self.enc, NV_ENC_CODEC_HEVC_GUID, preset, tuning, &mut *preset_cfg),
+            api.nvEncGetEncodePresetConfigEx.context("nvEncGetEncodePresetConfigEx")?(self.enc, codec_guid, preset, tuning, &mut *preset_cfg),
             "GetEncodePresetConfigEx",
         )?;
 
         let mut config: Box<NV_ENC_CONFIG> = Box::new(preset_cfg.presetCfg);
         config.version = NV_ENC_CONFIG_VER;
         // 两个方向统一用 4:2:0：码率更低，Mac 的硬件编码器和各家硬件解码器都支持
-        config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
+        config.profileGUID = profile;
         config.gopLength = NVENC_INFINITE_GOPLENGTH;
         config.frameIntervalP = 1; // 无 B 帧
 
@@ -112,12 +117,24 @@ impl Encoder {
         rc.vbvBufferSize = bitrate / fps; // 一帧
         rc.vbvInitialDelay = rc.vbvBufferSize;
 
-        let hevc = &mut config.encodeCodecConfig.hevcConfig;
-        hevc.set_chromaFormatIDC(1); // YUV 4:2:0（BGRA → YUV 的转换在 NVENC 内部完成）
-        hevc.set_repeatSPSPPS(1); // 每个 IDR 都带参数集，控制端可随时加入
-        hevc.idrPeriod = NVENC_INFINITE_GOPLENGTH;
-        // NVENC 内部把 BGRA 按 BT.601 limited 转成 YUV；在 VUI 里如实声明，解码端才能精确还原。
-        let vui = &mut hevc.hevcVUIParameters;
+        // NVENC 内部把 BGRA 按 BT.601 limited 转成 YUV（4:2:0）；在 VUI 里如实声明，解码端才能精确还原。
+        // 每个 IDR 都带参数集，控制端可随时加入。
+        let vui = match codec {
+            Codec::Hevc => {
+                let hevc = &mut config.encodeCodecConfig.hevcConfig;
+                hevc.set_chromaFormatIDC(1);
+                hevc.set_repeatSPSPPS(1);
+                hevc.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+                &mut hevc.hevcVUIParameters
+            }
+            Codec::H264 => {
+                let h264 = &mut config.encodeCodecConfig.h264Config;
+                h264.chromaFormatIDC = 1;
+                h264.set_repeatSPSPPS(1);
+                h264.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+                &mut h264.h264VUIParameters
+            }
+        };
         vui.videoSignalTypePresentFlag = 1;
         vui.videoFormat = _NV_ENC_VUI_VIDEO_FORMAT::NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
         vui.videoFullRangeFlag = 0;
@@ -128,7 +145,7 @@ impl Encoder {
 
         let mut init: Box<NV_ENC_INITIALIZE_PARAMS> = Box::default();
         init.version = NV_ENC_INITIALIZE_PARAMS_VER;
-        init.encodeGUID = NV_ENC_CODEC_HEVC_GUID;
+        init.encodeGUID = codec_guid;
         init.presetGUID = preset;
         init.tuningInfo = tuning;
         init.encodeWidth = self.width;
@@ -144,7 +161,7 @@ impl Encoder {
         init.encodeConfig = &mut *config;
         check(
             api.nvEncInitializeEncoder.context("nvEncInitializeEncoder")?(self.enc, &mut *init),
-            "InitializeEncoder（该显卡可能不支持 HEVC 编码，需要 GTX 950 / 10 系及以上）",
+            "InitializeEncoder（显卡可能不支持该编码格式；HEVC 需要 GTX 950 / 10 系及以上）",
         )?;
 
         let mut bs = NV_ENC_CREATE_BITSTREAM_BUFFER { version: NV_ENC_CREATE_BITSTREAM_BUFFER_VER, ..Default::default() };

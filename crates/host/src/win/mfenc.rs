@@ -1,12 +1,12 @@
-//! Media Foundation 硬件 HEVC 编码：没有 NVIDIA 显卡（或显示器接在 Intel/AMD 显卡上）时的备选。
+//! Media Foundation 硬件编码（HEVC 或 H.264）：没有 NVIDIA 显卡（或显示器接在 Intel/AMD 显卡上）时的备选。
 //!
-//! 显卡驱动（Intel Quick Sync、AMD VCN、NVIDIA）都会注册一个硬件 HEVC 编码 MFT。流程：
+//! 显卡驱动（Intel Quick Sync、AMD VCN、NVIDIA）都会注册硬件编码 MFT。流程：
 //! 采集到的 BGRA 纹理 → D3D11 视频处理器（缩放 + 转 NV12，BT.709 有限范围）→ 硬件 MFT → Annex-B。
 //! 硬件 MFT 都是异步的：等 `METransformNeedInput` 再送一帧，等 `METransformHaveOutput` 再取码流。
 //! 每次只送一帧、取到输出再返回，和 NVENC 的同步模式一样，不排队、不攒帧。
 
 use anyhow::{bail, Context, Result};
-use rc_protocol::hevc;
+use rc_protocol::{h264, hevc, Codec};
 use std::mem::ManuallyDrop;
 use windows::core::{Interface, GUID};
 use windows::Win32::Foundation::VARIANT_BOOL;
@@ -20,7 +20,7 @@ use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0
 pub struct Encoder {
     mft: IMFTransform,
     events: IMFMediaEventGenerator,
-    codec: Option<ICodecAPI>,
+    codec_api: Option<ICodecAPI>,
     vctx: ID3D11VideoContext,
     processor: ID3D11VideoProcessor,
     input_view: ID3D11VideoProcessorInputView,
@@ -32,6 +32,7 @@ pub struct Encoder {
     headers: Vec<u8>,
     fps: u32,
     frame_idx: u64,
+    codec: Codec,
     /// 编码器名称（日志用）
     pub name: String,
     _manager: IMFDXGIDeviceManager,
@@ -70,9 +71,16 @@ unsafe fn adapter_luid(device: &ID3D11Device) -> Option<u64> {
     Some(((l.HighPart as u32 as u64) << 32) | l.LowPart as u64)
 }
 
-/// 枚举硬件 HEVC 编码器，优先和采集同一块显卡的。
-unsafe fn find_encoders(device: &ID3D11Device) -> Result<Vec<(IMFActivate, String)>> {
-    let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_HEVC };
+fn subtype(codec: Codec) -> GUID {
+    match codec {
+        Codec::Hevc => MFVideoFormat_HEVC,
+        Codec::H264 => MFVideoFormat_H264,
+    }
+}
+
+/// 枚举硬件编码器，优先和采集同一块显卡的。
+unsafe fn find_encoders(device: &ID3D11Device, codec: Codec) -> Result<Vec<(IMFActivate, String)>> {
+    let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: subtype(codec) };
     let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count = 0u32;
     MFTEnumEx(
@@ -83,7 +91,7 @@ unsafe fn find_encoders(device: &ID3D11Device) -> Result<Vec<(IMFActivate, Strin
         &mut list,
         &mut count,
     )
-    .context("枚举 HEVC 编码器")?;
+    .with_context(|| format!("枚举 {} 编码器", codec.name()))?;
     let luid = adapter_luid(device);
     let mut same = Vec::new();
     let mut other = Vec::new();
@@ -110,7 +118,7 @@ unsafe fn friendly_name(act: &IMFActivate) -> String {
     if act.GetString(&MFT_FRIENDLY_NAME_Attribute, &mut buf, Some(&mut len)).is_ok() {
         return String::from_utf16_lossy(&buf[..len as usize]);
     }
-    "硬件 HEVC 编码器".into()
+    "硬件编码器".into()
 }
 
 impl Encoder {
@@ -123,6 +131,7 @@ impl Encoder {
         size: (u32, u32),
         fps: u32,
         bitrate_mbps: u32,
+        codec: Codec,
     ) -> Result<Self> {
         unsafe {
             MFStartup(MF_VERSION, MFSTARTUP_FULL).context("MFStartup")?;
@@ -138,19 +147,19 @@ impl Encoder {
 
             let (vctx, processor, input_view, output_view, nv12) = make_converter(device, context, src, src_size, size, fps)?;
 
-            let encoders = find_encoders(device)?;
+            let encoders = find_encoders(device, codec)?;
             if encoders.is_empty() {
-                bail!("没有找到硬件 HEVC 编码器（显卡太旧或驱动未安装）");
+                bail!("没有找到硬件 {} 编码器（显卡太旧或驱动未安装）", codec.name());
             }
             let mut last_err = None;
             for (act, name) in encoders {
-                match open_mft(&act, &manager, size, fps, bitrate_mbps) {
-                    Ok((mft, codec, headers)) => {
+                match open_mft(&act, &manager, size, fps, bitrate_mbps, codec) {
+                    Ok((mft, codec_api, headers)) => {
                         let events: IMFMediaEventGenerator = mft.cast().context("编码器不是异步 MFT")?;
                         return Ok(Self {
                             mft,
                             events,
-                            codec,
+                            codec_api,
                             vctx,
                             processor,
                             input_view,
@@ -160,6 +169,7 @@ impl Encoder {
                             headers,
                             fps,
                             frame_idx: 0,
+                            codec,
                             name,
                             _manager: manager,
                         });
@@ -205,7 +215,7 @@ impl Encoder {
             sample.SetSampleDuration(dur)?;
             self.frame_idx += 1;
             if force_idr {
-                if let Some(c) = &self.codec {
+                if let Some(c) = &self.codec_api {
                     let _ = c.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &var_u32(1));
                 }
             }
@@ -274,9 +284,13 @@ impl Encoder {
         buf.Lock(&mut ptr, None, Some(&mut len))?;
         let mut data = std::slice::from_raw_parts(ptr, len as usize).to_vec();
         let _ = buf.Unlock();
-        let key = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0
-            || hevc::nals(&data).any(|n| !n.is_empty() && hevc::is_irap(hevc::nal_type(n)));
-        if key && !self.headers.is_empty() && !hevc::nals(&data).any(|n| !n.is_empty() && hevc::nal_type(n) == hevc::NAL_VPS) {
+        let key = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0 || self.codec.is_keyframe(&data);
+        // 参数集打头的 NAL：HEVC 是 VPS，H.264 是 SPS
+        let has_params = hevc::nals(&data).any(|n| match self.codec {
+            Codec::Hevc => hevc::nal_type(n) == hevc::NAL_VPS,
+            Codec::H264 => h264::nal_type(n) == h264::NAL_SPS,
+        });
+        if key && !self.headers.is_empty() && !has_params {
             let mut v = self.headers.clone();
             v.extend_from_slice(&data);
             data = v;
@@ -311,6 +325,7 @@ unsafe fn open_mft(
     size: (u32, u32),
     fps: u32,
     bitrate_mbps: u32,
+    codec: Codec,
 ) -> Result<(IMFTransform, Option<ICodecAPI>, Vec<u8>)> {
     let mft: IMFTransform = act.ActivateObject().context("ActivateObject")?;
     let attrs = mft.GetAttributes()?;
@@ -319,8 +334,8 @@ unsafe fn open_mft(
     mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize).context("设置 D3D 设备")?;
 
     let bitrate = bitrate_mbps.saturating_mul(1_000_000);
-    let codec: Option<ICodecAPI> = mft.cast().ok();
-    if let Some(c) = &codec {
+    let codec_api: Option<ICodecAPI> = mft.cast().ok();
+    if let Some(c) = &codec_api {
         // 编码参数要在设置格式之前给
         let _ = c.SetValue(&CODECAPI_AVEncCommonRateControlMode, &var_u32(eAVEncCommonRateControlMode_CBR.0 as u32));
         let _ = c.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &var_u32(bitrate));
@@ -336,13 +351,17 @@ unsafe fn open_mft(
     let rate = ((fps as u64) << 32) | 1;
     let out = MFCreateMediaType()?;
     out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-    out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_HEVC)?;
+    out.SetGUID(&MF_MT_SUBTYPE, &subtype(codec))?;
     out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
     out.SetUINT64(&MF_MT_FRAME_SIZE, frame_size)?;
     out.SetUINT64(&MF_MT_FRAME_RATE, rate)?;
     out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-    out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32)?;
-    mft.SetOutputType(0, &out, 0).context("设置输出格式（HEVC Main）")?;
+    let profile = match codec {
+        Codec::Hevc => eAVEncH265VProfile_Main_420_8.0 as u32,
+        Codec::H264 => eAVEncH264VProfile_High.0 as u32,
+    };
+    out.SetUINT32(&MF_MT_MPEG2_PROFILE, profile)?;
+    mft.SetOutputType(0, &out, 0).with_context(|| format!("设置输出格式（{}）", codec.name()))?;
 
     let input = find_input_type(&mft, &NV12)?;
     input.SetUINT64(&MF_MT_FRAME_SIZE, frame_size)?;
@@ -358,7 +377,7 @@ unsafe fn open_mft(
     let headers = mft.GetOutputCurrentType(0).ok().and_then(|t| sequence_header(&t)).unwrap_or_default();
     mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
     mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
-    Ok((mft, codec, headers))
+    Ok((mft, codec_api, headers))
 }
 
 const NV12: GUID = MFVideoFormat_NV12;

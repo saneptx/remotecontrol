@@ -21,6 +21,8 @@ pub struct Connection {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// 被控端选定的视频格式
+    pub codec: proto::Codec,
     pub host_name: String,
     pub addr: SocketAddr,
     /// 打开数据通道（剪贴板、文件）用的凭据
@@ -42,15 +44,22 @@ pub fn parse_addr(host: &str) -> Result<SocketAddr> {
 
 /// 只做配对（已配对则直接返回）：拿到配对密钥并确认对方接受后立即断开，不打开远程画面。
 pub fn pair(addr: SocketAddr, on_event: impl FnMut(HandshakeEvent)) -> Result<()> {
-    handshake(addr, on_event, true, false).map(|_| ())
+    handshake(addr, on_event, true, false, Vec::new()).map(|_| ())
 }
 
 /// 连接并完成握手。未配对时会发起配对：`on_event` 收到配对码，用户需要在被控端点“允许”。
-pub fn connect(addr: SocketAddr, want_audio: bool, on_event: impl FnMut(HandshakeEvent)) -> Result<Connection> {
-    handshake(addr, on_event, false, want_audio)?.context("握手未完成")
+/// `codecs`：本机能解码的视频格式，按优先顺序。
+pub fn connect(addr: SocketAddr, want_audio: bool, codecs: Vec<proto::Codec>, on_event: impl FnMut(HandshakeEvent)) -> Result<Connection> {
+    handshake(addr, on_event, false, want_audio, codecs)?.context("握手未完成")
 }
 
-fn handshake(addr: SocketAddr, mut on_event: impl FnMut(HandshakeEvent), pair_only: bool, want_audio: bool) -> Result<Option<Connection>> {
+fn handshake(
+    addr: SocketAddr,
+    mut on_event: impl FnMut(HandshakeEvent),
+    pair_only: bool,
+    want_audio: bool,
+    codecs: Vec<proto::Codec>,
+) -> Result<Option<Connection>> {
     let device_id = config::device_id()?;
     let mut tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).with_context(|| format!("连接 {addr} 失败"))?;
     tcp.set_nodelay(true)?;
@@ -114,9 +123,9 @@ fn handshake(addr: SocketAddr, mut on_event: impl FnMut(HandshakeEvent), pair_on
     let mac = proto::pair::client_mac(&key, &host_nonce, &client_nonce);
     let audio = if want_audio { UdpSocket::bind("0.0.0.0:0").ok() } else { None };
     let audio_port = audio.as_ref().and_then(|a| a.local_addr().ok()).map(|a| a.port()).unwrap_or(0);
-    proto::write_msg(&mut tcp, &ClientMsg::Auth { mac, udp_port: udp.local_addr()?.port(), audio_port })?;
+    proto::write_msg(&mut tcp, &ClientMsg::Auth { mac, udp_port: udp.local_addr()?.port(), audio_port, codecs })?;
     match proto::read_msg(&mut tcp)? {
-        HostMsg::Welcome { width, height, fps, host_proof, data_token, video_port, audio_port } => {
+        HostMsg::Welcome { width, height, fps, host_proof, data_token, video_port, audio_port, codec } => {
             if !proto::pair::ct_eq(&host_proof, &proto::pair::host_proof(&key, &host_nonce, &client_nonce)) {
                 bail!("被控端身份验证失败：对方不是配对时的那台机器（可能被冒充），已中止连接");
             }
@@ -132,7 +141,7 @@ fn handshake(addr: SocketAddr, mut on_event: impl FnMut(HandshakeEvent), pair_on
                     spawn_punch(a, SocketAddr::new(addr.ip(), audio_port));
                 }
             }
-            Ok(Some(Connection { tcp, udp, width, height, fps, host_name, addr, data_token, audio }))
+            Ok(Some(Connection { tcp, udp, width, height, fps, codec, host_name, addr, data_token, audio }))
         }
         HostMsg::Reject { reason } => bail!("被控端拒绝连接: {reason}"),
         other => bail!("握手失败: {other:?}"),

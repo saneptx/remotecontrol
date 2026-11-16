@@ -8,6 +8,7 @@
 pub mod audio;
 pub mod data;
 pub mod discovery;
+pub mod h264;
 pub mod hevc;
 pub mod image;
 pub mod pair;
@@ -17,7 +18,7 @@ pub mod video;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const DEFAULT_PORT: u16 = 47800;
 /// 局域网发现使用的 UDP 端口。
 pub const DISCOVERY_PORT: u16 = 47801;
@@ -64,7 +65,8 @@ pub enum ClientMsg {
     DataHello { token: [u8; 16] },
     /// `mac` 见 [`pair::client_mac`]；`udp_port` 为控制端接收视频的端口；
     /// `audio_port` 为接收声音的端口（0 表示不要声音）。
-    Auth { mac: [u8; 32], udp_port: u16, audio_port: u16 },
+    /// `codecs`：控制端能解码的视频格式，按优先顺序排列；被控端选第一个自己能编码的。
+    Auth { mac: [u8; 32], udp_port: u16, audio_port: u16, codecs: Vec<Codec> },
     Input(InputEvent),
     RequestKeyframe,
     Ping { t_us: u64 },
@@ -84,7 +86,8 @@ pub enum HostMsg {
     /// `host_proof` 见 [`pair::host_proof`]；`data_token` 用于打开数据通道。
     /// `video_port` / `audio_port` 是被控端发送视频、声音所用的 UDP 端口：控制端先从自己的接收端口
     /// 往这里发小包（UDP 打洞），本机防火墙就会把对方发来的数据当作回复放行，无需添加防火墙规则。
-    Welcome { width: u32, height: u32, fps: u32, host_proof: [u8; 32], data_token: [u8; 16], video_port: u16, audio_port: u16 },
+    /// `codec` 为被控端选定的视频格式（整个会话不变）。
+    Welcome { width: u32, height: u32, fps: u32, host_proof: [u8; 32], data_token: [u8; 16], video_port: u16, audio_port: u16, codec: Codec },
     Reject { reason: String },
     /// `t_us` 原样返回，`host_us` 为被控端时钟，用于估算两端时钟差。
     Pong { t_us: u64, host_us: u64 },
@@ -94,6 +97,33 @@ pub enum HostMsg {
     Cursor { shape: CursorShape },
     /// 被控端的显示器列表和当前显示的那块；连接后发送一次，切换显示器后再发送。
     Displays { list: Vec<DisplayInfo>, current: u32 },
+}
+
+/// 视频编码格式。两端都是 Annex-B 码流、4:2:0、无 B 帧、关键帧带参数集。
+///
+/// 默认 HEVC：同样画质码率更低。H.264 是备选：Windows 控制端没装“HEVC 视频扩展”、
+/// 或被控端显卡只有 H.264 硬件编码时使用。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Codec {
+    Hevc,
+    H264,
+}
+
+impl Codec {
+    pub fn name(self) -> &'static str {
+        match self {
+            Codec::Hevc => "HEVC",
+            Codec::H264 => "H.264",
+        }
+    }
+
+    /// 访问单元是否可作为解码起点。
+    pub fn is_keyframe(self, au: &[u8]) -> bool {
+        match self {
+            Codec::Hevc => hevc::contains_irap(au),
+            Codec::H264 => h264::contains_idr(au),
+        }
+    }
 }
 
 /// 被控端的一块显示器。

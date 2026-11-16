@@ -1,4 +1,4 @@
-//! macOS 被控端：ScreenCaptureKit 采集 → VideoToolbox HEVC 编码；CGEvent 注入输入。
+//! macOS 被控端：ScreenCaptureKit 采集 → VideoToolbox 编码（HEVC，或 H.264 备选）；CGEvent 注入输入。
 //!
 //! 需要两项系统权限：“屏幕录制”（采集画面和声音）与“辅助功能”（操作键鼠）。
 
@@ -119,6 +119,7 @@ pub struct MacSource {
     fps: u32,
     fps_arg: Option<u32>,
     bitrate: u32,
+    codec: rc_protocol::Codec,
     /// 正在采集的显示器（CGDirectDisplayID）
     display: u32,
     /// 控制端窗口像素尺寸；(0, 0) 表示原始分辨率
@@ -140,7 +141,9 @@ fn stream_config(w: u32, h: u32, fps: u32) -> SCStreamConfiguration {
 }
 
 impl MacSource {
-    pub fn new(args: &Args) -> Result<Self> {
+    /// `codecs`：控制端能解码的格式（按优先顺序）。VideoToolbox 两种都能编，取第一个。
+    pub fn new(args: &Args, codecs: &[rc_protocol::Codec]) -> Result<Self> {
+        let codec = *codecs.first().context("控制端没有可用的视频格式")?;
         power::wake_display();
         if !unsafe { CGPreflightScreenCaptureAccess() } {
             bail!("{NEED_SCREEN}");
@@ -175,8 +178,8 @@ impl MacSource {
                 .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         }
         stream.start_capture().map_err(|e| anyhow::anyhow!("开始采集失败: {e:?}"))?;
-        let enc = vt::Encoder::new(w, h, fps, args.bitrate)?;
-        println!("采集 {w}x{h} @ {refresh}Hz，VideoToolbox HEVC，{} Mbps，上限 {fps} fps", args.bitrate);
+        let enc = vt::Encoder::new(w, h, fps, args.bitrate, codec)?;
+        println!("采集 {w}x{h} @ {refresh}Hz，VideoToolbox {}，{} Mbps，上限 {fps} fps", codec.name(), args.bitrate);
         Ok(Self {
             stream,
             filter,
@@ -187,6 +190,7 @@ impl MacSource {
             fps,
             fps_arg: args.fps,
             bitrate: args.bitrate,
+            codec,
             display,
             viewport: (0, 0),
             area: Arc::new(Mutex::new(display_bounds(display))),
@@ -204,6 +208,10 @@ impl MacSource {
 }
 
 impl VideoSource for MacSource {
+    fn codec(&self) -> rc_protocol::Codec {
+        self.codec
+    }
+
     fn displays(&self) -> Vec<rc_protocol::DisplayInfo> {
         let Ok(content) = shareable() else { return Vec::new() };
         let main = unsafe { CGMainDisplayID() };
@@ -239,7 +247,7 @@ impl VideoSource for MacSource {
         let (ew, eh) = encode_size((w, h), self.viewport);
         self.stream.update_content_filter(&filter).map_err(|e| anyhow::anyhow!("切换显示器失败: {e:?}"))?;
         self.stream.update_configuration(&stream_config(ew, eh, fps)).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        self.enc = vt::Encoder::new(ew, eh, fps, self.bitrate)?;
+        self.enc = vt::Encoder::new(ew, eh, fps, self.bitrate, self.codec)?;
         self.filter = filter;
         self.display = id;
         self.size = (w, h);
@@ -277,7 +285,7 @@ impl VideoSource for MacSource {
             return Ok(());
         }
         self.stream.update_configuration(&stream_config(w, h, self.fps)).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        self.enc = vt::Encoder::new(w, h, self.fps, self.bitrate)?;
+        self.enc = vt::Encoder::new(w, h, self.fps, self.bitrate, self.codec)?;
         self.last = None;
         self.pending_key = true;
         println!("编码分辨率 {w}x{h}（采集 {}x{}）", self.size.0, self.size.1);

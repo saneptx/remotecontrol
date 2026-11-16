@@ -1,8 +1,9 @@
-//! VideoToolbox HEVC 硬件编码：实时、无 B 帧、只在请求时出关键帧，输出 Annex-B（关键帧带 VPS/SPS/PPS）。
+//! VideoToolbox 硬件编码：实时、无 B 帧、只在请求时出关键帧，输出 Annex-B（关键帧带参数集）。
 //!
-//! 两个方向统一用 HEVC 4:2:0（Main）：码率低，各家硬件编解码器都支持。
+//! 默认 HEVC 4:2:0（Main）：码率低；控制端解不了 HEVC 时用 H.264（High）。
 
 use anyhow::{bail, Result};
+use rc_protocol::Codec;
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::sync::Mutex;
@@ -23,6 +24,7 @@ struct CMTime {
 const CMTIME_VALID: u32 = 1;
 const INVALID_TIME: CMTime = CMTime { value: 0, timescale: 0, flags: 0, epoch: 0 };
 const CODEC_HEVC: u32 = u32::from_be_bytes(*b"hvc1");
+const CODEC_H264: u32 = u32::from_be_bytes(*b"avc1");
 const CF_NUMBER_SINT32: i32 = 3;
 const CF_NUMBER_DOUBLE: i32 = 13;
 
@@ -60,6 +62,14 @@ extern "C" {
         count: *mut usize,
         nal_header_len: *mut i32,
     ) -> OSStatus;
+    fn CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+        desc: CFTypeRef,
+        index: usize,
+        ptr: *mut *const u8,
+        size: *mut usize,
+        count: *mut usize,
+        nal_header_len: *mut i32,
+    ) -> OSStatus;
 }
 
 #[link(name = "VideoToolbox", kind = "framework")]
@@ -74,6 +84,7 @@ extern "C" {
     static kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality: CFTypeRef;
     static kVTEncodeFrameOptionKey_ForceKeyFrame: CFTypeRef;
     static kVTProfileLevel_HEVC_Main_AutoLevel: CFTypeRef;
+    static kVTProfileLevel_H264_High_AutoLevel: CFTypeRef;
     static kVTVideoEncoderSpecification_EnableLowLatencyRateControl: CFTypeRef;
     static kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: CFTypeRef;
     fn VTCompressionSessionCreate(
@@ -120,7 +131,10 @@ fn cf_dict(pairs: &[(CFTypeRef, CFTypeRef)]) -> CFTypeRef {
 }
 
 /// 编码回调写入的结果。
-type Output = Mutex<Option<(Vec<u8>, bool)>>;
+struct Output {
+    frame: Mutex<Option<(Vec<u8>, bool)>>,
+    codec: Codec,
+}
 
 pub struct Encoder {
     session: VTSession,
@@ -136,13 +150,13 @@ extern "C" fn on_output(refcon: *mut c_void, _src: *mut c_void, status: OSStatus
         return;
     }
     let out = unsafe { &*(refcon as *const Output) };
-    if let Some(au) = unsafe { to_annex_b(sample) } {
-        *out.lock().unwrap() = Some(au);
+    if let Some(au) = unsafe { to_annex_b(sample, out.codec) } {
+        *out.frame.lock().unwrap() = Some(au);
     }
 }
 
 /// 把 VideoToolbox 输出（长度前缀的 NAL）转成 Annex-B。返回 (数据, 是否关键帧)。
-unsafe fn to_annex_b(sample: *mut c_void) -> Option<(Vec<u8>, bool)> {
+unsafe fn to_annex_b(sample: *mut c_void, codec: Codec) -> Option<(Vec<u8>, bool)> {
     let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, 0);
     let keyframe = attachments.is_null()
         || CFArrayGetCount(attachments) == 0
@@ -152,13 +166,17 @@ unsafe fn to_annex_b(sample: *mut c_void) -> Option<(Vec<u8>, bool)> {
     let mut nal_len = 4i32;
     if keyframe {
         let desc = CMSampleBufferGetFormatDescription(sample);
+        let get = match codec {
+            Codec::Hevc => CMVideoFormatDescriptionGetHEVCParameterSetAtIndex,
+            Codec::H264 => CMVideoFormatDescriptionGetH264ParameterSetAtIndex,
+        };
         let mut count = 0usize;
         let (mut p, mut sz) = (null(), 0usize);
-        if CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(desc, 0, &mut p, &mut sz, &mut count, &mut nal_len) != 0 {
+        if get(desc, 0, &mut p, &mut sz, &mut count, &mut nal_len) != 0 {
             return None;
         }
         for i in 0..count {
-            if CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(desc, i, &mut p, &mut sz, null_mut(), null_mut()) == 0 {
+            if get(desc, i, &mut p, &mut sz, null_mut(), null_mut()) == 0 {
                 out.extend_from_slice(&[0, 0, 0, 1]);
                 out.extend_from_slice(std::slice::from_raw_parts(p, sz));
             }
@@ -189,8 +207,12 @@ unsafe fn to_annex_b(sample: *mut c_void) -> Option<(Vec<u8>, bool)> {
 }
 
 impl Encoder {
-    pub fn new(width: u32, height: u32, fps: u32, bitrate_mbps: u32) -> Result<Self> {
-        let output: Box<Output> = Box::new(Mutex::new(None));
+    pub fn new(width: u32, height: u32, fps: u32, bitrate_mbps: u32, codec: Codec) -> Result<Self> {
+        let output: Box<Output> = Box::new(Output { frame: Mutex::new(None), codec });
+        let (codec_type, profile) = match codec {
+            Codec::Hevc => (CODEC_HEVC, unsafe { kVTProfileLevel_HEVC_Main_AutoLevel }),
+            Codec::H264 => (CODEC_H264, unsafe { kVTProfileLevel_H264_High_AutoLevel }),
+        };
         unsafe {
             let mut session: VTSession = null_mut();
             let create = |spec: CFTypeRef, session: &mut VTSession| {
@@ -198,7 +220,7 @@ impl Encoder {
                     null(),
                     width as i32,
                     height as i32,
-                    CODEC_HEVC,
+                    codec_type,
                     spec,
                     null(),
                     null(),
@@ -220,7 +242,7 @@ impl Encoder {
                 CFRelease(hw);
             }
             if status != 0 {
-                bail!("创建 HEVC 硬件编码器失败: {status}");
+                bail!("创建 {} 硬件编码器失败: {status}", codec.name());
             }
 
             let set = |key: CFTypeRef, value: CFTypeRef, own: bool| {
@@ -231,7 +253,7 @@ impl Encoder {
             };
             set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue, false);
             set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, false);
-            set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel, false);
+            set(kVTCompressionPropertyKey_ProfileLevel, profile, false);
             set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue, false);
             set(kVTCompressionPropertyKey_MaxKeyFrameInterval, cf_i32(i32::MAX), true);
             set(kVTCompressionPropertyKey_ExpectedFrameRate, cf_i32(fps as i32), true);
@@ -262,7 +284,7 @@ impl Encoder {
             }
             VTCompressionSessionCompleteFrames(self.session, INVALID_TIME);
         }
-        Ok(self.output.lock().unwrap().take())
+        Ok(self.output.frame.lock().unwrap().take())
     }
 }
 

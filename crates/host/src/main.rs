@@ -315,7 +315,7 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
             Err(e) => return Err(e.into()),
         };
     }
-    let ClientMsg::Auth { mac, udp_port, audio_port } = auth else {
+    let ClientMsg::Auth { mac, udp_port, audio_port, codecs } = auth else {
         bail!("握手失败：期望 Auth");
     };
     if !proto::pair::ct_eq(&mac, &proto::pair::client_mac(&key, &nonce, &client_nonce)) {
@@ -326,7 +326,7 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
     println!("控制端已连接: {device_name}（{peer}）");
 
     // ---- 打开采集/编码 ----
-    let (mut video_src, mut input) = match open_platform(args) {
+    let (mut video_src, mut input) = match open_platform(args, &codecs) {
         Ok(v) => v,
         Err(e) => {
             proto::write_msg(&mut tcp, &HostMsg::Reject { reason: format!("被控端初始化失败: {e:#}") })?;
@@ -372,6 +372,7 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
         data_token,
         video_port: udp.local_addr()?.port(),
         audio_port: audio_udp.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port()).unwrap_or(0),
+        codec: video_src.codec(),
     };
     proto::write_msg(&mut tcp, &welcome)?;
     // 会话期间保持显示器常亮
@@ -580,8 +581,8 @@ impl SimLoss {
 }
 
 #[cfg(windows)]
-fn open_platform(args: &Args) -> Result<(Box<dyn VideoSource>, Box<dyn InputSink>)> {
-    let src = win::WinSource::new(args)?;
+fn open_platform(args: &Args, codecs: &[proto::Codec]) -> Result<(Box<dyn VideoSource>, Box<dyn InputSink>)> {
+    let src = win::WinSource::new(args, codecs)?;
     let input = win::input::Injector::new(src.area());
     Ok((Box::new(src), Box::new(input)))
 }
@@ -592,12 +593,15 @@ pub fn test_source() -> bool {
 }
 
 #[cfg(not(windows))]
-fn open_platform(args: &Args) -> Result<(Box<dyn VideoSource>, Box<dyn InputSink>)> {
+fn open_platform(args: &Args, codecs: &[proto::Codec]) -> Result<(Box<dyn VideoSource>, Box<dyn InputSink>)> {
     #[cfg(target_os = "macos")]
     if !test_source() {
-        let src = mac::MacSource::new(args)?;
+        let src = mac::MacSource::new(args, codecs)?;
         let input = mac::input::Injector::new(src.area());
         return Ok((Box::new(src), Box::new(input)));
+    }
+    if !codecs.contains(&proto::Codec::Hevc) {
+        bail!("测试图像源只能输出 HEVC");
     }
     eprintln!("注意：使用测试图像源（ffmpeg testsrc2），输入事件只打印不注入。");
     Ok((Box::new(testsrc::TestSource::new(args)?), Box::new(testsrc::LogInput)))
