@@ -95,6 +95,10 @@ fn worker_args(args: &Args) -> Vec<String> {
     if let Some(fps) = args.fps {
         v.extend(["--fps".into(), fps.to_string()]);
     }
+    if args.encoder != crate::EncoderChoice::Auto {
+        v.push("--encoder".into());
+        v.push(format!("{:?}", args.encoder).to_lowercase());
+    }
     if args.allow_sleep {
         v.push("--allow-sleep".into());
     }

@@ -6,7 +6,7 @@
 | | 实现 |
 |---|---|
 | 采集 | DXGI Desktop Duplication（画面无变化时不发送任何数据） |
-| 编码 | HEVC 4:2:0（Windows：NVENC；Mac：VideoToolbox），超低延迟设置，无 B 帧，CBR + 单帧 VBV，显存内零拷贝；按控制端窗口的实际像素尺寸在显卡上缩小后再编码 |
+| 编码 | HEVC 4:2:0（Windows：优先 NVENC，没有 NVIDIA 显卡时用系统的硬件编码器，即 Intel Quick Sync / AMD VCN 的 Media Foundation 编码器；Mac：VideoToolbox），超低延迟设置，无 B 帧，CBR + 单帧 VBV，显存内零拷贝；按控制端窗口的实际像素尺寸在显卡上缩小后再编码 |
 | 传输 | 视频走 UDP（≤1400 字节分片 + Reed-Solomon 前向纠错，零星丢包直接还原，不重传）；控制走 TCP_NODELAY |
 | 解码显示 | VideoToolbox 硬解 + AVSampleBufferDisplayLayer，解完立即上屏，不缓冲 |
 | 输入 | 绝对坐标鼠标、滚轮、扫描码键盘，经 SendInput 注入；本地光标跟随被控端的光标形状（箭头、I 形、手指、调整大小等） |
@@ -32,7 +32,7 @@
   `SuperControl-macos-arm64`
 - 正式版本：推送 `v*` 标签（如 `git tag v0.1.0 && git push origin v0.1.0`）后会自动发布到 **Releases**
 
-Windows 包里只有两个文件，放在同一个文件夹，不需要安装运行库（被控需要 NVIDIA 显卡与较新驱动）：
+Windows 包里只有两个文件，放在同一个文件夹，不需要安装运行库（被控需要支持 HEVC 硬件编码的显卡：NVIDIA GTX 10 系、Intel 6 代酷睿核显、AMD RX 400 系及以上）：
 
 - `SuperControl.exe` — 界面，双击打开；
 - `rc-host.exe` — 被控端，由界面调用，不需要手动运行。
@@ -113,7 +113,7 @@ rc-client hosts / forget <名称>  # 查看 / 删除已配对的被控端
 
 ### 从源码构建
 
-被控端（Windows，需要 NVIDIA GTX 10 系及以上显卡、较新驱动、Rust MSVC 工具链）：
+被控端（Windows，需要支持 HEVC 硬件编码的显卡与较新驱动、Rust MSVC 工具链；可用 `--encoder nvenc|mf` 指定编码器）：
 
 ```
 cargo build --release -p rc-host

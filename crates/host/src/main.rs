@@ -78,6 +78,17 @@ pub struct Args {
     /// 由界面程序启动：父进程（界面）退出后本进程也退出
     #[arg(long, hide = true)]
     pub exit_with_parent: bool,
+    /// Windows 视频编码器：auto 先试 NVENC，不行再用系统硬件编码器（Intel/AMD）
+    #[arg(long, value_enum, default_value_t = EncoderChoice::Auto)]
+    pub encoder: EncoderChoice,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EncoderChoice {
+    Auto,
+    Nvenc,
+    /// Media Foundation 硬件编码器
+    Mf,
 }
 
 /// 进程启动以来的微秒数；采集时间戳与 Pong 共用这一时钟。

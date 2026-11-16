@@ -1,4 +1,7 @@
-//! Windows 被控端：DXGI Desktop Duplication 采集 → NVENC HEVC 编码，全程显存内零拷贝。
+//! Windows 被控端：DXGI Desktop Duplication 采集 → 硬件 HEVC 编码，全程显存内零拷贝。
+//!
+//! 编码器优先用 NVENC；没有 NVIDIA 显卡（或显示器接在 Intel/AMD 显卡上）时改用
+//! Media Foundation 的硬件 HEVC 编码器（Intel Quick Sync、AMD VCN 等）。
 
 mod capture;
 mod cursor;
@@ -6,13 +9,14 @@ pub mod cliphelper;
 mod desktop;
 pub mod dialog;
 pub mod input;
+mod mfenc;
 mod nvenc;
 pub mod power;
 mod scale;
 pub mod service;
 
 use crate::source::{encode_size, Area, EncodedFrame, VideoSource};
-use crate::{now_us, Args};
+use crate::{now_us, Args, EncoderChoice};
 use anyhow::{bail, Result};
 use capture::{Capturer, State};
 use std::time::{Duration, Instant};
@@ -20,8 +24,29 @@ use windows::Win32::Graphics::Direct3D11::{ID3D11Query, D3D11_QUERY_DESC, D3D11_
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 /// 采集 →（缩放）→ 编码管线。字段按声明顺序析构：编码器必须先于它引用的纹理/设备释放。
+enum Enc {
+    Nv(nvenc::Encoder),
+    Mf(mfenc::Encoder),
+}
+
+impl Enc {
+    fn encode(&mut self, force_idr: bool) -> Result<(Vec<u8>, bool)> {
+        match self {
+            Enc::Nv(e) => e.encode(force_idr),
+            Enc::Mf(e) => e.encode(force_idr),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Enc::Nv(_) => "NVENC HEVC 4:2:0".into(),
+            Enc::Mf(e) => format!("{} (Media Foundation)", e.name),
+        }
+    }
+}
+
 struct Pipeline {
-    enc: nvenc::Encoder,
+    enc: Enc,
     scaler: Option<scale::Scaler>,
     /// GPU 栅栏：等拷贝/缩放真正执行完，用于分段计时。
     fence: ID3D11Query,
@@ -29,17 +54,36 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    fn open(display: usize, fps: Option<u32>, bitrate: u32, viewport: (u32, u32)) -> Result<(Self, u32)> {
+    fn open(display: usize, fps: Option<u32>, bitrate: u32, viewport: (u32, u32), choice: EncoderChoice) -> Result<(Self, u32)> {
         let cap = Capturer::new(display)?;
         let fps = fps.unwrap_or(cap.refresh_hz).clamp(1, 240);
-        let (scaler, enc) = Self::make_encoder(&cap, fps, bitrate, viewport)?;
+        let (scaler, enc) = Self::make_encoder(&cap, fps, bitrate, viewport, choice)?;
         let mut fence = None;
         unsafe { cap.device().CreateQuery(&D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 }, Some(&mut fence))? };
         Ok((Self { enc, scaler, fence: fence.unwrap(), cap }, fps))
     }
 
-    /// 按控制端窗口尺寸创建编码器；需要缩小时在前面接一个显卡缩放器。
-    fn make_encoder(cap: &Capturer, fps: u32, bitrate: u32, viewport: (u32, u32)) -> Result<(Option<scale::Scaler>, nvenc::Encoder)> {
+    /// 按控制端窗口尺寸创建编码器：先试 NVENC，不行再用 Media Foundation 硬件编码器。
+    fn make_encoder(cap: &Capturer, fps: u32, bitrate: u32, viewport: (u32, u32), choice: EncoderChoice) -> Result<(Option<scale::Scaler>, Enc)> {
+        if choice != EncoderChoice::Mf {
+            match Self::make_nvenc(cap, fps, bitrate, viewport) {
+                Ok((scaler, enc)) => return Ok((scaler, Enc::Nv(enc))),
+                Err(e) if choice == EncoderChoice::Nvenc => return Err(e),
+                Err(e) => eprintln!("NVENC 不可用，改用系统硬件编码器: {e:#}"),
+            }
+        }
+        let src = (cap.width, cap.height);
+        let (w, h) = encode_size(src, viewport);
+        // NV12 要求宽高为偶数
+        let (w, h) = (w & !1, h & !1);
+        let enc = mfenc::Encoder::new(cap.device(), cap.context(), cap.target(), src, (w, h), fps, bitrate)
+            .map_err(|e| anyhow::anyhow!("{e:#}（NVENC 和系统硬件编码器都不可用）"))?;
+        println!("编码分辨率 {w}x{h}（采集 {}x{}），编码器：{}", src.0, src.1, enc.name);
+        Ok((None, Enc::Mf(enc)))
+    }
+
+    /// NVENC；需要缩小时在前面接一个显卡缩放器。
+    fn make_nvenc(cap: &Capturer, fps: u32, bitrate: u32, viewport: (u32, u32)) -> Result<(Option<scale::Scaler>, nvenc::Encoder)> {
         let src = (cap.width, cap.height);
         let (w, h) = encode_size(src, viewport);
         if (w, h) != src {
@@ -56,8 +100,8 @@ impl Pipeline {
         Ok((None, nvenc::Encoder::new(cap.device(), cap.target(), src.0, src.1, fps, bitrate)?))
     }
 
-    fn resize(&mut self, fps: u32, bitrate: u32, viewport: (u32, u32)) -> Result<()> {
-        let (scaler, enc) = Self::make_encoder(&self.cap, fps, bitrate, viewport)?;
+    fn resize(&mut self, fps: u32, bitrate: u32, viewport: (u32, u32), choice: EncoderChoice) -> Result<()> {
+        let (scaler, enc) = Self::make_encoder(&self.cap, fps, bitrate, viewport, choice)?;
         self.enc = enc; // 旧编码器在这里析构，随后才替换它引用的旧缩放纹理
         self.scaler = scaler;
         Ok(())
@@ -95,6 +139,7 @@ pub struct WinSource {
     inner: Option<Pipeline>,
     fps_arg: Option<u32>,
     bitrate: u32,
+    encoder: EncoderChoice,
     width: u32,
     height: u32,
     rect: (i32, i32, u32, u32),
@@ -160,7 +205,7 @@ impl WinSource {
         // 默认采集主显示器
         let display = capture::list_outputs().iter().position(|o| o.primary()).unwrap_or(0);
         let (pipe, fps) = loop {
-            match Pipeline::open(display, args.fps, args.bitrate, (0, 0)) {
+            match Pipeline::open(display, args.fps, args.bitrate, (0, 0), args.encoder) {
                 Ok(v) => break v,
                 Err(e) if Instant::now() < deadline => {
                     eprintln!("初始化采集失败，重试中: {e:#}");
@@ -171,7 +216,7 @@ impl WinSource {
             }
         };
         let cap = &pipe.cap;
-        println!("采集 {}x{} @ {}Hz，NVENC HEVC 4:2:0，{} Mbps，上限 {} fps", cap.width, cap.height, cap.refresh_hz, args.bitrate, fps);
+        println!("采集 {}x{} @ {}Hz，{}，{} Mbps，上限 {} fps", cap.width, cap.height, cap.refresh_hz, pipe.enc.label(), args.bitrate, fps);
         let min_interval = Duration::from_secs_f64(0.9 / fps as f64);
         Ok(Self {
             width: cap.width,
@@ -182,6 +227,7 @@ impl WinSource {
             inner: Some(pipe),
             fps_arg: args.fps,
             bitrate: args.bitrate,
+            encoder: args.encoder,
             fps,
             min_interval,
             last_encode: Instant::now() - min_interval,
@@ -209,7 +255,7 @@ impl WinSource {
         }
         self.last_rebuild = Instant::now();
         power::wake_display();
-        match Pipeline::open(self.display, self.fps_arg, self.bitrate, self.viewport) {
+        match Pipeline::open(self.display, self.fps_arg, self.bitrate, self.viewport, self.encoder) {
             Ok((p, _)) => {
                 if (p.cap.width, p.cap.height) != (self.width, self.height) {
                     bail!("屏幕分辨率已变化（{}x{} → {}x{}），请重新连接", self.width, self.height, p.cap.width, p.cap.height);
@@ -284,7 +330,7 @@ impl VideoSource for WinSource {
         let device = info.device.clone();
         // 先释放旧管线（编码器、采集），再为新显示器建立
         self.inner = None;
-        match Pipeline::open(index, self.fps_arg, self.bitrate, self.viewport) {
+        match Pipeline::open(index, self.fps_arg, self.bitrate, self.viewport, self.encoder) {
             Ok((p, fps)) => {
                 let cap = &p.cap;
                 println!("采集 {device} {}x{} @ {}Hz", cap.width, cap.height, cap.refresh_hz);
@@ -301,7 +347,7 @@ impl VideoSource for WinSource {
                 self.notice = None;
                 Ok(())
             }
-            // 新显示器打不开（例如接在集成显卡上，NVENC 用不了）：退回原来那块，由 next_frame 重建
+            // 新显示器打不开：退回原来那块，由 next_frame 重建
             Err(e) => bail!("{e:#}"),
         }
     }
@@ -312,7 +358,7 @@ impl VideoSource for WinSource {
         }
         self.viewport = (width, height);
         let Some(p) = self.inner.as_mut() else { return Ok(()) };
-        if let Err(e) = p.resize(self.fps, self.bitrate, self.viewport) {
+        if let Err(e) = p.resize(self.fps, self.bitrate, self.viewport, self.encoder) {
             // 新编码器建不起来时整条管线重建（try_rebuild 会按新尺寸来）。
             eprintln!("调整编码分辨率失败: {e:#}");
             self.inner = None;
