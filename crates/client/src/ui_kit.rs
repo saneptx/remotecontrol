@@ -136,6 +136,17 @@ pub fn text_button(ui: &mut Ui, text: &str, color: Color32) -> Response {
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// 关闭按钮（手绘的 ×，不依赖字体里有没有这个符号）。
+pub fn close_button(ui: &mut Ui, color: Color32) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+    let c = if resp.hovered() { Color32::WHITE } else { color };
+    let r = rect.shrink(5.0);
+    let s = Stroke::new(1.5, c);
+    ui.painter().line_segment([r.left_top(), r.right_bottom()], s);
+    ui.painter().line_segment([r.right_top(), r.left_bottom()], s);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// 开关（打开时为黑色）。
 pub struct Toggle<'a>(pub &'a mut bool);
 

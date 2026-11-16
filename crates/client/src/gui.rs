@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::io::BufRead;
 use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -98,6 +99,17 @@ struct Session {
     child: Child,
     /// 子进程 stderr 的最后几行（出错时显示）。
     stderr: Arc<Mutex<Vec<String>>>,
+    /// 画面窗口已和对方完成握手（它在 stdout 打印“已连接…”时置位）。
+    ready: Arc<AtomicBool>,
+}
+
+impl Session {
+    /// 子进程 stderr 里最能说明问题的一行。
+    fn last_error(&self) -> String {
+        let lines = self.stderr.lock().unwrap();
+        let line = lines.iter().rev().find(|l| l.starts_with("Error")).or(lines.last()).cloned().unwrap_or_default();
+        line.trim_start_matches("Error: ").to_string()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -226,12 +238,39 @@ impl Gui {
                     });
                 }
             }
-            match spawn_viewer(&name, addr, &settings, os.as_deref()) {
-                Ok(s) => set(Job::Started(s)),
-                Err(e) => set(Job::Failed {
-                    name,
-                    error: format!("{e:#}"),
-                }),
+            let mut s = match spawn_viewer(&name, addr, &settings, os.as_deref()) {
+                Ok(s) => s,
+                Err(e) => {
+                    return set(Job::Failed {
+                        name,
+                        error: format!("{e:#}"),
+                    })
+                }
+            };
+            // 画面窗口真正连上对方之后才算成功；连不上时它会带着错误退出。
+            // 等待上限覆盖握手的最长超时（TCP 连接 5 秒 + 握手 15 秒）。
+            let deadline = Instant::now() + Duration::from_secs(25);
+            loop {
+                if s.ready.load(Ordering::Relaxed) {
+                    return set(Job::Started(s));
+                }
+                if let Ok(Some(_)) = s.child.try_wait() {
+                    std::thread::sleep(Duration::from_millis(100)); // 让 stderr 读完
+                    let error = match s.last_error() {
+                        e if e.is_empty() => "画面窗口意外退出".to_string(),
+                        e => e,
+                    };
+                    return set(Job::Failed { name, error });
+                }
+                if Instant::now() > deadline {
+                    let _ = s.child.kill();
+                    let _ = s.child.wait();
+                    return set(Job::Failed {
+                        name,
+                        error: "连接超时：对方可能已关机、睡眠或不在同一局域网".into(),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
         });
     }
@@ -979,7 +1018,7 @@ impl Gui {
                             ui.add(
                                 egui::Label::new(RichText::new(&text).size(13.0).color(fg)).wrap(),
                             );
-                            if kit::text_button(ui, "✕", kit::TEXT_FAINT).clicked() {
+                            if kit::close_button(ui, Color32::from_gray(150)).clicked() {
                                 close = true;
                             }
                         });
@@ -1259,9 +1298,21 @@ fn spawn_viewer(
     }
     let mut child = cmd
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    let ready = Arc::new(AtomicBool::new(false));
+    if let Some(pipe) = child.stdout.take() {
+        let ready = ready.clone();
+        // 一直读到进程退出，否则管道写满会卡住画面窗口
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(pipe).lines().map_while(|l| l.ok()) {
+                if line.starts_with("已连接") {
+                    ready.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+    }
     let stderr = Arc::new(Mutex::new(Vec::new()));
     if let Some(pipe) = child.stderr.take() {
         let lines = stderr.clone();
@@ -1279,6 +1330,7 @@ fn spawn_viewer(
         name: name.to_string(),
         child,
         stderr,
+        ready,
     })
 }
 
