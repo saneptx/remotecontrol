@@ -34,7 +34,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// 安装为 Windows 系统服务：随 RemoteControl 界面启动，可控制锁屏、登录界面与 UAC 弹窗（需要管理员权限）
+    /// 安装为 Windows 系统服务：随 SuperControl 界面启动，可控制锁屏、登录界面与 UAC 弹窗（需要管理员权限）
     Install(Args),
     /// 卸载系统服务（需要管理员权限）
     Uninstall,
@@ -406,6 +406,7 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
     let result = (|| -> Result<()> {
         let mut frame_id = 0u32;
         let mut notice: Option<String> = None;
+        let mut cursor: Option<proto::CursorShape> = None;
         let mut loss = SimLoss::new(args.sim_loss);
         // 窗口拖动缩放时会连续收到很多尺寸：稳定 300ms 后才重建编码器。第一次立即生效。
         let (mut applied_vp, mut pending_vp) = (NO_VIEWPORT, NO_VIEWPORT);
@@ -433,6 +434,12 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
                 }
                 proto::write_msg(&mut *writer.lock().unwrap(), &HostMsg::Notice { text: current.clone() })?;
                 notice = current;
+            }
+
+            let shape = video_src.cursor();
+            if shape.is_some() && shape != cursor {
+                proto::write_msg(&mut *writer.lock().unwrap(), &HostMsg::Cursor { shape: shape.unwrap() })?;
+                cursor = shape;
             }
 
             let Some(frame) = frame else { continue };

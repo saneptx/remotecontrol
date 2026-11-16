@@ -17,7 +17,7 @@ pub mod video;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const DEFAULT_PORT: u16 = 47800;
 /// 局域网发现使用的 UDP 端口。
 pub const DISCOVERY_PORT: u16 = 47801;
@@ -88,6 +88,39 @@ pub enum HostMsg {
     Pong { t_us: u64, host_us: u64 },
     /// 被控端状态提示（例如处于锁屏、无法采集）；`None` 表示恢复正常。
     Notice { text: Option<String> },
+    /// 被控端当前的光标形状，变化时发送；控制端把本地光标换成同样的形状。
+    Cursor { shape: CursorShape },
+}
+
+/// 光标形状（系统标准光标）。应用自绘的光标按箭头处理。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CursorShape {
+    Arrow,
+    /// 文本输入（I 形）
+    Text,
+    /// 链接（手指）
+    Hand,
+    /// 忙（沙漏 / 转圈）
+    Wait,
+    /// 后台忙（箭头 + 转圈）
+    Progress,
+    Crosshair,
+    /// 上下调整
+    ResizeNS,
+    /// 左右调整
+    ResizeEW,
+    /// 左上-右下调整
+    ResizeNWSE,
+    /// 右上-左下调整
+    ResizeNESW,
+    /// 移动（四向箭头）
+    Move,
+    NotAllowed,
+    Help,
+    /// 被控端隐藏了光标（例如全屏视频、打字时）
+    Hidden,
+    /// 光标已画在画面里（macOS 被控端），控制端隐藏本地光标
+    InVideo,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]

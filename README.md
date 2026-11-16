@@ -1,6 +1,7 @@
-# remotecontrol
+# SuperControl
 
-局域网远程控制工具：**Windows 被控端 → macOS 控制端**，目标是超低延迟与高保真画面。
+局域网远程控制工具：Windows 与 Mac 互相控制，目标是超低延迟与高保真画面。两台电脑都打开 SuperControl，
+就能在“设备”列表里看到对方并一键连接。
 
 | | 实现 |
 |---|---|
@@ -8,7 +9,7 @@
 | 编码 | HEVC 4:2:0（Windows：NVENC；Mac：VideoToolbox），超低延迟设置，无 B 帧，CBR + 单帧 VBV，显存内零拷贝；按控制端窗口的实际像素尺寸在显卡上缩小后再编码 |
 | 传输 | 视频走 UDP（≤1400 字节分片 + Reed-Solomon 前向纠错，零星丢包直接还原，不重传）；控制走 TCP_NODELAY |
 | 解码显示 | VideoToolbox 硬解 + AVSampleBufferDisplayLayer，解完立即上屏，不缓冲 |
-| 输入 | 绝对坐标鼠标、滚轮、扫描码键盘，经 SendInput 注入 |
+| 输入 | 绝对坐标鼠标、滚轮、扫描码键盘，经 SendInput 注入；本地光标跟随被控端的光标形状（箭头、I 形、手指、调整大小等） |
 | 发现 | UDP 广播，打开控制端即可看到局域网里所有被控端 |
 | 声音 | WASAPI 环回采集被控端正在播放的声音，原始 PCM 经 UDP 传输（不压缩、无编解码延迟），控制端抖动缓冲约 30 ms 后播放 |
 | 剪贴板与文件 | 独立的数据通道（不影响键鼠响应）：文字、图片双向自动同步；拖文件进窗口发送到远端，远端复制的文件按 ⌘⇧D 取回 |
@@ -18,24 +19,27 @@
 
 - `crates/protocol` — 协议：控制消息、UDP 分片/重组、HEVC Annex-B 解析
 - `crates/host` — 被控端（Windows；其它平台只有用于联调的测试图像源）
-- `crates/client` — 控制端（macOS）
+- `crates/client` — SuperControl 界面与控制端（macOS / Windows）
+- `packaging/icon` — 应用图标（`draw-icon.swift` 绘制，`build-icons.sh` 生成 .icns / .ico）
 
 ## 下载
 
 不想自己编译的话，GitHub Actions 每次推送都会自动构建：
 
-- 最新构建：仓库的 **Actions** 页 → 最近一次成功的 `build` → 页面底部 Artifacts 里的 `rc-host-windows-x64`
+- 最新构建：仓库的 **Actions** 页 → 最近一次成功的 `build` → 页面底部 Artifacts 里的 `SuperControl-windows-x64` /
+  `SuperControl-macos-arm64`
 - 正式版本：推送 `v*` 标签（如 `git tag v0.1.0 && git push origin v0.1.0`）后会自动发布到 **Releases**
 
-`rc-host.exe` 是单个文件，不需要安装任何运行库（需要 NVIDIA 显卡与较新驱动）。两种用法：
+Windows 包里只有两个文件，放在同一个文件夹，不需要安装运行库（被控需要 NVIDIA 显卡与较新驱动）：
 
-- **临时使用**：双击 `rc-host.exe`。首次运行时防火墙会弹窗，选择允许“专用网络”。
-  这种方式看不到也操作不了锁屏和 UAC 弹窗。
-- **安装为系统服务（推荐）**：双击 `install-service.cmd`（会请求管理员权限，只需一次），或在 `rc-client.exe`
-  界面里点“安装”。锁屏、登录界面、UAC 弹窗和以管理员身份运行的程序都能正常显示和操作。详见下文。
+- `SuperControl.exe` — 界面，双击打开；
+- `rc-host.exe` — 被控端，由界面调用，不需要手动运行。
 
-被控端只在 RemoteControl 界面（`rc-client.exe` / Mac 上的 RemoteControl.app）打开期间运行：打开界面时自动启动，
-关闭界面后自动停止。两台电脑都打开 RemoteControl 才能互相控制。界面里可以用“允许其他设备控制这台电脑”临时关闭。
+第一次打开后在“设置 → 被控制”里点“安装”（会请求一次管理员权限）：程序装到 `C:\Program Files\SuperControl\`，
+开始菜单出现 SuperControl。之后锁屏、登录界面、UAC 弹窗和以管理员身份运行的程序都能正常显示和操作。
+
+被控端只在 SuperControl 打开期间运行：打开时自动启动，关闭后自动停止。两台电脑都打开 SuperControl 才能互相控制，
+“设置”里可以用“允许其他设备控制这台电脑”临时关闭。
 
 ## 系统服务模式
 
@@ -46,10 +50,10 @@ rc-host.exe devices            # 列出已配对的控制端
 rc-host.exe forget <名称>       # 删除已配对的控制端（--all 删除全部）
 ```
 
-需要在管理员终端里执行（或直接双击 `install-service.cmd` / `uninstall-service.cmd`）。`install` 会：
+需要在管理员终端里执行（界面里的“安装 / 卸载”按钮做的就是这个）。`install` 会：
 
-1. 把程序复制到 `C:\Program Files\RemoteControl\`；
-2. 创建 `C:\ProgramData\RemoteControl\`（仅 SYSTEM 和管理员可读），保存本机标识与已配对设备；
+1. 把 `rc-host.exe` 和同目录的 `SuperControl.exe` 复制到 `C:\Program Files\SuperControl\`，并在开始菜单创建快捷方式；
+2. 创建 `C:\ProgramData\RemoteControl\`（仅 SYSTEM 和管理员可读，沿用旧名以保留配对），保存本机标识与已配对设备；
 3. 添加防火墙入站规则（专用 / 域网络）；
 4. 注册手动启动的系统服务（允许普通用户启动 / 停止，由界面程序启动），崩溃后自动重启；
    界面关闭（或崩溃）后服务在几秒内自行停止。
@@ -58,7 +62,7 @@ rc-host.exe forget <名称>       # 删除已配对的控制端（--all 删除�
 
 运行日志在 `C:\ProgramData\RemoteControl\host.log`（需要管理员权限查看）。
 
-**连不上时**：双击 `diagnose.cmd`（或在管理员终端运行 `rc-host.exe status`），它会检查服务是否运行、端口是否在监听、
+**连不上时**：在管理员终端运行 `rc-host.exe status`，它会检查服务是否运行、端口是否在监听、
 网络是否被识别为“公用网络”、防火墙规则是否存在，并显示最近的日志。
 
 **原理**：服务运行在看不到屏幕的 session 0 里，它在当前登录会话中以 SYSTEM 身份启动工作进程；
@@ -72,7 +76,7 @@ SYSTEM 身份可以进入锁屏 / UAC 所在的安全桌面，工作进程在桌
 ## 使用方法
 
 1. Windows 上安装被控端（见上文“系统服务模式”）。
-2. Mac 上打开 `RemoteControl.app`（`packaging/macos/make-app.sh --install` 生成并安装到“应用程序”）。
+2. Mac 上打开 `SuperControl.app`（`packaging/macos/make-app.sh --install` 生成并安装到“应用程序”）。
    首次打开时 macOS 会询问是否允许访问本地网络，请选择“允许”。
 3. 界面会自动列出局域网里的被控端，点“连接”。
 4. **首次连接需要配对**：Mac 上显示一个 6 位配对码，Windows 上同时弹出确认框显示同一个配对码，
@@ -86,7 +90,7 @@ SYSTEM 身份可以进入锁屏 / UAC 所在的安全桌面，工作进程在桌
   同时放进 Windows 剪贴板，在任意文件夹里按 Ctrl+V 即可粘贴到那里。
 - **Windows → Mac 传文件**：在 Windows 资源管理器里复制文件（Ctrl+C），窗口标题会提示“远端复制了 …”，
   按 **⌘⇧D** 保存到 Mac 的“下载”文件夹，同时放进 Mac 剪贴板，可在访达里 ⌘V 粘贴。
-- 首次接收文件时 macOS 可能询问是否允许 RemoteControl 访问“下载”文件夹，请选择允许。
+- 首次接收文件时 macOS 可能询问是否允许 SuperControl 访问“下载”文件夹，请选择允许。
 
 界面里的设置：
 
@@ -116,7 +120,7 @@ cargo build --release -p rc-host
 控制端（macOS）：
 
 ```
-packaging/macos/make-app.sh            # 生成 target/RemoteControl.app
+packaging/macos/make-app.sh            # 生成 target/SuperControl.app
 ```
 
 被控端常用参数：

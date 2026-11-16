@@ -196,7 +196,7 @@ fn mac_dialog(client: &str, peer: &str, code: &str) -> bool {
         code
     );
     let script = format!(
-        "display dialog \"{text}\" with title \"RemoteControl 配对请求\" buttons {{\"拒绝\", \"允许\"}} default button \"拒绝\" with icon caution giving up after 60"
+        "display dialog \"{text}\" with title \"SuperControl 配对请求\" buttons {{\"拒绝\", \"允许\"}} default button \"拒绝\" with icon caution giving up after 60"
     );
     std::process::Command::new("osascript")
         .args(["-e", &script])

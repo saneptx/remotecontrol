@@ -45,8 +45,8 @@ extern "C" {
     fn CFRelease(cf: *const c_void);
 }
 
-const NEED_SCREEN: &str = "这台 Mac 没有授予“屏幕录制”权限：请在 系统设置 → 隐私与安全性 → 录屏与系统录音 中允许 RemoteControl，然后重新连接";
-const NEED_ACCESSIBILITY: &str = "这台 Mac 没有授予“辅助功能”权限，只能看不能操作：请在 系统设置 → 隐私与安全性 → 辅助功能 中允许 RemoteControl";
+const NEED_SCREEN: &str = "这台 Mac 没有授予“屏幕录制”权限：请在 系统设置 → 隐私与安全性 → 录屏与系统录音 中允许 SuperControl，然后重新连接";
+const NEED_ACCESSIBILITY: &str = "这台 Mac 没有授予“辅助功能”权限，只能看不能操作：请在 系统设置 → 隐私与安全性 → 辅助功能 中允许 SuperControl";
 
 /// 启动时检查权限，缺少时触发系统的授权提示。
 pub fn request_permissions() {
@@ -163,6 +163,11 @@ impl MacSource {
 }
 
 impl VideoSource for MacSource {
+    // 读不到其他应用光标的可靠形状（系统箭头、I 形光标是动态生成的），所以光标直接画在画面里
+    fn cursor(&mut self) -> Option<rc_protocol::CursorShape> {
+        Some(rc_protocol::CursorShape::InVideo)
+    }
+
     fn size(&self) -> (u32, u32) {
         self.size
     }

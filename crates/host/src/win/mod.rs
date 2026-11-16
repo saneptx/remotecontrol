@@ -1,6 +1,7 @@
 //! Windows 被控端：DXGI Desktop Duplication 采集 → NVENC HEVC 编码，全程显存内零拷贝。
 
 mod capture;
+mod cursor;
 pub mod cliphelper;
 mod desktop;
 pub mod dialog;
@@ -110,6 +111,7 @@ pub struct WinSource {
     /// 控制端窗口像素尺寸；(0, 0) 表示原始分辨率。
     viewport: (u32, u32),
     prof: Profile,
+    cursors: cursor::Cursors,
 }
 
 /// 被控端分段耗时，每 5 秒写一行日志，用于定位延迟。
@@ -182,6 +184,7 @@ impl WinSource {
             last_rebuild: Instant::now(),
             viewport: (0, 0),
             prof: Profile::new(),
+            cursors: cursor::Cursors::new(),
         })
     }
 
@@ -240,6 +243,10 @@ impl VideoSource for WinSource {
 
     fn notice(&self) -> Option<String> {
         self.notice.clone()
+    }
+
+    fn cursor(&mut self) -> Option<rc_protocol::CursorShape> {
+        Some(self.cursors.current())
     }
 
     fn set_viewport(&mut self, width: u32, height: u32) -> Result<()> {

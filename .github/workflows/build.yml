@@ -33,15 +33,16 @@ jobs:
           if ($deps -match 'VCRUNTIME|MSVCP|api-ms-win-crt') { throw "rc-host.exe 仍依赖 C 运行库" }
           $deps = & $dumpbin.FullName /dependents target\release\rc-client.exe | Out-String
           if ($deps -match 'VCRUNTIME|MSVCP|api-ms-win-crt') { throw "rc-client.exe 仍依赖 C 运行库" }
-      # exe 与安装脚本放在同一目录（脚本按自身所在目录查找 rc-host.exe）
+      # 界面程序改名为 SuperControl.exe；rc-host.exe 必须和它放在同一目录
       - name: 打包
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/release/rc-host.exe, target/release/rc-client.exe, packaging/windows/*.cmd dist/
+          Copy-Item target/release/rc-host.exe dist/
+          Copy-Item target/release/rc-client.exe dist/SuperControl.exe
       - uses: actions/upload-artifact@v4
         with:
-          name: rc-host-windows-x64
+          name: SuperControl-windows-x64
           path: dist/
           if-no-files-found: error
 
@@ -55,11 +56,11 @@ jobs:
       - run: cargo test --workspace
       - run: packaging/macos/make-app.sh
       # 打成 zip 以保留应用包结构与可执行权限
-      - run: ditto -c -k --keepParent target/RemoteControl.app RemoteControl-macos-arm64.zip
+      - run: ditto -c -k --keepParent target/SuperControl.app SuperControl-macos-arm64.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: RemoteControl-macos-arm64
-          path: RemoteControl-macos-arm64.zip
+          name: SuperControl-macos-arm64
+          path: SuperControl-macos-arm64.zip
           if-no-files-found: error
 
   release:
@@ -75,9 +76,6 @@ jobs:
         with:
           files: |
             rc-host.exe
-            rc-client.exe
-            install-service.cmd
-            uninstall-service.cmd
-            diagnose.cmd
-            RemoteControl-macos-arm64.zip
+            SuperControl.exe
+            SuperControl-macos-arm64.zip
           generate_release_notes: true

@@ -249,11 +249,18 @@ pub struct Shared {
 }
 
 /// 读控制通道：处理 Pong 估算时钟差；连接断开时调用 `on_closed`。
-pub fn spawn_control_reader(mut tcp: TcpStream, shared: Arc<Shared>, on_closed: impl FnOnce() + Send + 'static) {
+pub fn spawn_control_reader(
+    mut tcp: TcpStream,
+    shared: Arc<Shared>,
+    on_cursor: impl Fn(proto::CursorShape) + Send + 'static,
+    on_closed: impl FnOnce() + Send + 'static,
+) {
     std::thread::spawn(move || {
         let mut best_rtt = u64::MAX;
         while let Ok(msg) = proto::read_msg::<HostMsg>(&mut tcp) {
-            if let HostMsg::Notice { text } = msg {
+            if let HostMsg::Cursor { shape } = msg {
+                on_cursor(shape);
+            } else if let HostMsg::Notice { text } = msg {
                 match &text {
                     Some(t) => eprintln!("被控端: {t}"),
                     None => eprintln!("被控端: 画面已恢复"),

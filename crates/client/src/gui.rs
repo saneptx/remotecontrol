@@ -1,11 +1,12 @@
-//! 控制端图形界面：发现局域网里的被控端、配对、一键连接、设置。
+//! SuperControl 图形界面：发现局域网里的电脑、配对、一键连接、设置。
 //!
 //! 远程画面窗口在独立进程里运行（`rc-client view <地址>`）：每个连接互不影响，
 //! 画面窗口崩溃也不会带走主界面。
 
+use crate::ui_kit::{self as kit, Toggle};
 use crate::{awdl, config, net};
 use anyhow::Result;
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, Color32, Margin, RichText, Sense, Vec2};
 use rc_protocol::{self as proto, DeviceId};
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -14,16 +15,67 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+const ICON_PNG: &[u8] = include_bytes!("../../../packaging/icon/icon-256.png");
+
 pub fn run() -> Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("SuperControl")
+        .with_inner_size([900.0, 620.0])
+        .with_min_inner_size([680.0, 480.0]);
+    if let Some((rgba, w, h)) = decode_png(ICON_PNG) {
+        viewport = viewport.with_icon(Arc::new(egui::IconData {
+            rgba,
+            width: w,
+            height: h,
+        }));
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("RemoteControl")
-            .with_inner_size([560.0, 640.0])
-            .with_min_inner_size([420.0, 420.0]),
+        viewport,
         ..Default::default()
     };
-    eframe::run_native("RemoteControl", options, Box::new(|cc| Ok(Box::new(Gui::new(&cc.egui_ctx)))))
-        .map_err(|e| anyhow::anyhow!("{e}"))
+    eframe::run_native(
+        "SuperControl",
+        options,
+        Box::new(|cc| Ok(Box::new(Gui::new(&cc.egui_ctx)))),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn decode_png(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let mut dec = png::Decoder::new(std::io::Cursor::new(bytes));
+    dec.set_transformations(
+        png::Transformations::normalize_to_color8() | png::Transformations::ALPHA,
+    );
+    let mut reader = dec.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    buf.truncate(info.buffer_size());
+    (info.color_type == png::ColorType::Rgba).then_some((buf, info.width, info.height))
+}
+
+/// 本机在局域网里的 IPv4 地址（显示给用户，方便对方手动连接）。跳过代理软件的虚拟网卡（198.18.x.x）。
+fn local_ip() -> Option<String> {
+    let mut best: Option<(u8, std::net::Ipv4Addr)> = None;
+    for iface in if_addrs::get_if_addrs().unwrap_or_default() {
+        let std::net::IpAddr::V4(ip) = iface.ip() else {
+            continue;
+        };
+        let o = ip.octets();
+        if ip.is_loopback() || ip.is_link_local() || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) {
+            continue;
+        }
+        let rank = if o[0] == 192 && o[1] == 168 {
+            3
+        } else if ip.is_private() {
+            2
+        } else {
+            1
+        };
+        if best.is_none_or(|(r, _)| rank > r) {
+            best = Some((rank, ip));
+        }
+    }
+    best.map(|(_, ip)| ip.to_string())
 }
 
 /// 后台扫描到的被控端（含最后一次出现的时间）。
@@ -48,8 +100,32 @@ struct Session {
     stderr: Arc<Mutex<Vec<String>>>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Page {
+    Devices,
+    Settings,
+}
+
+/// 设备卡片显示的内容。
+struct CardInfo {
+    name: String,
+    os: String,
+    addr: String,
+    online: bool,
+    paired: bool,
+    compatible: bool,
+    /// 点“连接”时用的参数
+    target: Option<(Option<DeviceId>, SocketAddr, Option<String>)>,
+    /// 点“忘记”时删除的配对记录
+    forget_id: Option<String>,
+}
+
 struct Gui {
+    page: Page,
+    logo: Option<egui::TextureHandle>,
     device_name: String,
+    local_ip: Option<String>,
+    ip_checked: Instant,
     seen: Arc<Mutex<HashMap<DeviceId, Seen>>>,
     manual_addr: String,
     settings: config::Settings,
@@ -60,17 +136,30 @@ struct Gui {
     host: HostRunner,
     job: Option<Arc<Mutex<Job>>>,
     sessions: Vec<Session>,
-    message: Option<(String, bool)>,
+    /// 底部提示：(内容, 是否错误, 出现时间)
+    message: Option<(String, bool, Instant)>,
     screenshot: Option<(String, Instant)>,
 }
 
 impl Gui {
     fn new(ctx: &egui::Context) -> Self {
+        kit::apply_theme(ctx);
+        kit::load_system_font(ctx);
         let seen = Arc::new(Mutex::new(HashMap::new()));
         spawn_scanner(seen.clone(), ctx.clone());
-        ctx.set_visuals(egui::Visuals::light());
+        let logo = decode_png(ICON_PNG).map(|(rgba, w, h)| {
+            let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+            ctx.load_texture("logo", img, egui::TextureOptions::LINEAR)
+        });
         Self {
+            page: match std::env::var("RC_GUI_PAGE").as_deref() {
+                Ok("settings") => Page::Settings,
+                _ => Page::Devices,
+            },
+            logo,
             device_name: config::device_name(),
+            local_ip: local_ip(),
+            ip_checked: Instant::now(),
             seen,
             manual_addr: String::new(),
             settings: config::settings(),
@@ -83,16 +172,34 @@ impl Gui {
             sessions: Vec::new(),
             message: None,
             // 自测：RC_GUI_SCREENSHOT=/路径.png 时，启动 2 秒后截取本窗口并退出
-            screenshot: std::env::var("RC_GUI_SCREENSHOT").ok().map(|p| (p, Instant::now())),
+            screenshot: std::env::var("RC_GUI_SCREENSHOT")
+                .ok()
+                .map(|p| (p, Instant::now())),
         }
     }
 
+    fn say(&mut self, text: impl Into<String>, error: bool) {
+        self.message = Some((text.into(), error, Instant::now()));
+    }
+
     fn busy(&self) -> bool {
-        self.job.as_ref().is_some_and(|j| matches!(*j.lock().unwrap(), Job::Connecting { .. } | Job::Pairing { .. }))
+        self.job.as_ref().is_some_and(|j| {
+            matches!(
+                *j.lock().unwrap(),
+                Job::Connecting { .. } | Job::Pairing { .. }
+            )
+        })
     }
 
     /// 发起连接：未配对时先在本界面完成配对（显示配对码），然后启动远程画面窗口。
-    fn connect(&mut self, ctx: &egui::Context, name: String, host_id: Option<DeviceId>, addr: SocketAddr, os: Option<String>) {
+    fn connect(
+        &mut self,
+        ctx: &egui::Context,
+        name: String,
+        host_id: Option<DeviceId>,
+        addr: SocketAddr,
+        os: Option<String>,
+    ) {
         self.message = None;
         let job = Arc::new(Mutex::new(Job::Connecting { name: name.clone() }));
         self.job = Some(job.clone());
@@ -107,17 +214,24 @@ impl Gui {
             if !paired {
                 // 先完成配对（不打开画面），再由画面窗口直接连接。
                 let result = net::pair(addr, |ev| match ev {
-                    net::HandshakeEvent::PairCode { host_name, code } => {
-                        set(Job::Pairing { name: host_name.to_string(), code: code.to_string() })
-                    }
+                    net::HandshakeEvent::PairCode { host_name, code } => set(Job::Pairing {
+                        name: host_name.to_string(),
+                        code: code.to_string(),
+                    }),
                 });
                 if let Err(e) = result {
-                    return set(Job::Failed { name, error: format!("{e:#}") });
+                    return set(Job::Failed {
+                        name,
+                        error: format!("{e:#}"),
+                    });
                 }
             }
             match spawn_viewer(&name, addr, &settings, os.as_deref()) {
                 Ok(s) => set(Job::Started(s)),
-                Err(e) => set(Job::Failed { name, error: format!("{e:#}") }),
+                Err(e) => set(Job::Failed {
+                    name,
+                    error: format!("{e:#}"),
+                }),
             }
         });
     }
@@ -126,17 +240,23 @@ impl Gui {
     fn poll(&mut self) {
         if let Some(job) = &self.job {
             let mut guard = job.lock().unwrap();
-            match std::mem::replace(&mut *guard, Job::Connecting { name: String::new() }) {
+            match std::mem::replace(
+                &mut *guard,
+                Job::Connecting {
+                    name: String::new(),
+                },
+            ) {
                 Job::Started(s) => {
-                    self.message = Some((format!("已打开「{}」的远程画面", s.name), false));
+                    let text = format!("已打开「{}」的远程画面", s.name);
                     self.sessions.push(s);
                     drop(guard);
                     self.job = None;
+                    self.say(text, false);
                 }
                 Job::Failed { name, error } => {
-                    self.message = Some((format!("连接「{name}」失败：{error}"), true));
                     drop(guard);
                     self.job = None;
+                    self.say(format!("连接「{name}」失败：{error}"), true);
                 }
                 other => *guard = other,
             }
@@ -147,15 +267,25 @@ impl Gui {
             Ok(Some(status)) => {
                 if !status.success() {
                     let lines = s.stderr.lock().unwrap();
-                    let err = lines.iter().rev().find(|l| l.starts_with("Error")).or(lines.last()).cloned().unwrap_or_default();
-                    ended.push(format!("「{}」的连接已断开：{}", s.name, err.trim_start_matches("Error: ")));
+                    let err = lines
+                        .iter()
+                        .rev()
+                        .find(|l| l.starts_with("Error"))
+                        .or(lines.last())
+                        .cloned()
+                        .unwrap_or_default();
+                    ended.push(format!(
+                        "「{}」的连接已断开：{}",
+                        s.name,
+                        err.trim_start_matches("Error: ")
+                    ));
                 }
                 false
             }
             _ => true,
         });
         if let Some(e) = ended.pop() {
-            self.message = Some((e, true));
+            self.say(e, true);
         }
 
         if let Some(rx) = &self.awdl_job {
@@ -163,7 +293,7 @@ impl Gui {
                 self.awdl_job = None;
                 self.awdl_guard = awdl::enabled();
                 if let Err(e) = r {
-                    self.message = Some((format!("设置 AWDL 自动处理失败：{e}"), true));
+                    self.say(format!("设置 AWDL 自动处理失败：{e}"), true);
                 }
             }
         }
@@ -171,115 +301,19 @@ impl Gui {
             self.awdl_checked = Instant::now();
             self.awdl_active = awdl::active();
         }
+        if self.ip_checked.elapsed() > Duration::from_secs(10) {
+            self.ip_checked = Instant::now();
+            self.local_ip = local_ip();
+        }
+        // 成功提示几秒后自动消失，错误提示保留到用户关闭
+        if self
+            .message
+            .as_ref()
+            .is_some_and(|(_, err, at)| !err && at.elapsed() > Duration::from_secs(5))
+        {
+            self.message = None;
+        }
         self.host.tick(self.settings.host);
-    }
-
-    fn device_list(&mut self, ui: &mut egui::Ui) {
-        let now = Instant::now();
-        let online: Vec<net::Discovered> = {
-            let seen = self.seen.lock().unwrap();
-            let mut v: Vec<_> = seen.values().filter(|s| now - s.at < Duration::from_secs(8)).map(|s| s.host.clone()).collect();
-            v.sort_by(|a, b| a.name.cmp(&b.name));
-            v
-        };
-        // 配对过但当前没扫描到的设备，也列出来（可按上次的地址直接连）
-        let offline: Vec<config::KnownHost> = config::known_hosts()
-            .into_iter()
-            .filter(|k| !online.iter().any(|d| proto::hex(&d.host_id) == k.id))
-            .collect();
-
-        if online.is_empty() && offline.is_empty() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new("正在扫描局域网…").weak());
-            });
-            ui.label(RichText::new("请确认对方已安装并运行被控端，且两台电脑连在同一个局域网。").weak().small());
-        }
-
-        let busy = self.busy();
-        let mut action: Option<(String, Option<DeviceId>, SocketAddr, Option<String>)> = None;
-        let mut forget: Option<String> = None;
-        for d in &online {
-            let compatible = d.version == proto::PROTOCOL_VERSION;
-            let badge = if !compatible {
-                "版本不一致，请把两端更新到同一版本"
-            } else if d.paired {
-                "已配对"
-            } else {
-                "未配对"
-            };
-            device_row(ui, &d.name, &d.os, &d.addr.to_string(), badge, d.paired && compatible, |ui| {
-                if ui.add_enabled(!busy && compatible, egui::Button::new("连接")).clicked() {
-                    action = Some((d.name.clone(), Some(d.host_id), d.addr, Some(d.os.clone())));
-                }
-                if d.paired && ui.small_button("忘记").on_hover_text("删除本机保存的配对信息").clicked() {
-                    forget = Some(proto::hex(&d.host_id));
-                }
-            });
-        }
-        for k in &offline {
-            let addr = k.last_addr.clone().unwrap_or_default();
-            device_row(ui, &k.name, "", &addr, "离线", false, |ui| {
-                let parsed = addr.parse::<SocketAddr>().ok();
-                if ui.add_enabled(!busy && parsed.is_some(), egui::Button::new("连接")).on_hover_text("按上次的地址尝试连接").clicked() {
-                    action = Some((k.name.clone(), proto::parse_hex16(&k.id), parsed.unwrap(), None));
-                }
-                if ui.small_button("忘记").clicked() {
-                    forget = Some(k.id.clone());
-                }
-            });
-        }
-        if let Some((name, id, addr, os)) = action {
-            self.connect(ui.ctx(), name, id, addr, os);
-        }
-        if let Some(id) = forget {
-            let _ = config::forget(&id);
-        }
-    }
-
-    fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        let mut changed = false;
-        let swap_label = if cfg!(target_os = "macos") {
-            "Command 键当作 Ctrl（⌘C / ⌘V 即复制粘贴）"
-        } else {
-            "控制 Mac 时 Ctrl 当作 Command（Ctrl+C / Ctrl+V 即复制粘贴）"
-        };
-        changed |= ui.checkbox(&mut self.settings.cmd_as_ctrl, swap_label).changed();
-        changed |= ui.checkbox(&mut self.settings.audio, "播放远端的声音").changed();
-        changed |= ui
-            .checkbox(&mut self.settings.native, "按原始分辨率传输")
-            .on_hover_text("默认按窗口的实际像素尺寸编码：显示效果相同，延迟和带宽更低")
-            .changed();
-        if changed {
-            let _ = config::save_settings(&self.settings);
-        }
-
-        if !cfg!(target_os = "macos") {
-            return;
-        }
-        let mut guard = self.awdl_guard;
-        let pending = self.awdl_job.is_some();
-        ui.horizontal(|ui| {
-            let resp = ui
-                .add_enabled(!pending, egui::Checkbox::new(&mut guard, "远程期间自动关闭 AWDL"))
-                .on_hover_text("AWDL 是隔空投送、接力使用的无线通道，会让 Wi-Fi 周期性停顿几十毫秒。\n开启后只在远程画面打开期间关闭它，其余时间不受影响。\n第一次开启需要输入一次管理员密码，之后切换不再需要。");
-            if pending {
-                ui.spinner();
-            }
-            if resp.changed() {
-                let (tx, rx) = std::sync::mpsc::channel();
-                self.awdl_job = Some(rx);
-                std::thread::spawn(move || {
-                    let _ = tx.send(awdl::set_enabled(guard).map_err(|e| format!("{e:#}")));
-                });
-            }
-        });
-        let (text, color) = if self.awdl_active {
-            ("当前 AWDL：开启", Color32::from_rgb(200, 120, 0))
-        } else {
-            ("当前 AWDL：关闭", Color32::from_rgb(40, 140, 60))
-        };
-        ui.label(RichText::new(text).small().color(color));
     }
 }
 
@@ -348,6 +382,11 @@ impl HostRunner {
     }
 
     #[cfg(target_os = "macos")]
+    fn installed(&self) -> bool {
+        true
+    }
+
+    #[cfg(target_os = "macos")]
     fn stop(&mut self) {
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
@@ -379,6 +418,11 @@ impl HostRunner {
     }
 
     #[cfg(windows)]
+    fn installed(&self) -> bool {
+        self.state.is_some()
+    }
+
+    #[cfg(windows)]
     fn stop(&mut self) {
         if matches!(self.state, Some(2 | 4)) {
             let _ = crate::winhost::control(false);
@@ -392,51 +436,481 @@ impl HostRunner {
         false
     }
     #[cfg(not(any(windows, target_os = "macos")))]
+    fn installed(&self) -> bool {
+        false
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn stop(&mut self) {}
 }
 
+// ---------------------------------------------------------------------------
+// 界面
+// ---------------------------------------------------------------------------
+
 impl Gui {
-    fn host_ui(&mut self, ui: &mut egui::Ui) {
-        let mut on = self.settings.host;
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui
-                .checkbox(&mut on, "允许其他设备控制这台电脑")
-                .on_hover_text("只在本程序打开期间可被控制，关闭本程序后停止。其他电脑首次连接时，这里会弹窗请你确认配对码。")
-                .changed()
-            {
-                self.settings.host = on;
-                let _ = config::save_settings(&self.settings);
-                self.host.error = None;
-                self.host.next_try = Instant::now();
+            if let Some(logo) = &self.logo {
+                ui.add(
+                    egui::Image::new(logo)
+                        .fit_to_exact_size(Vec2::splat(34.0))
+                        .corner_radius(8),
+                );
             }
-            if on {
-                let (text, color) = if self.host.running() { ("运行中", Color32::from_rgb(40, 140, 60)) } else { ("未运行", Color32::GRAY) };
-                ui.label(RichText::new(text).small().color(color));
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(
+                    RichText::new("SuperControl")
+                        .size(17.0)
+                        .strong()
+                        .color(kit::TEXT),
+                );
+                ui.label(
+                    RichText::new("局域网远程控制")
+                        .size(11.5)
+                        .color(kit::TEXT_WEAK),
+                );
+            });
+        });
+        ui.add_space(26.0);
+        self.nav_item(ui, Page::Devices, "设备", kit::icon_monitor);
+        self.nav_item(ui, Page::Settings, "设置", kit::icon_gear);
+    }
+
+    /// 侧边栏底部：本机信息。
+    fn local_card(&self, ui: &mut egui::Ui) {
+        {
+            egui::Frame::new()
+                .fill(Color32::WHITE)
+                .corner_radius(12)
+                .inner_margin(Margin::same(12))
+                .stroke((1.0, kit::BORDER))
+                .show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        ui.label(RichText::new("本机").size(11.5).color(kit::TEXT_FAINT));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&self.device_name)
+                                    .size(14.0)
+                                    .strong()
+                                    .color(kit::TEXT),
+                            )
+                            .truncate(),
+                        );
+                        if let Some(ip) = &self.local_ip {
+                            ui.label(RichText::new(ip).size(12.0).color(kit::TEXT_WEAK));
+                        }
+                        ui.add_space(4.0);
+                        let (text, dot) = self.host_status();
+                        kit::chip(ui, text, dot);
+                    });
+                });
+        }
+    }
+
+    /// 被控端状态：(文字, 圆点颜色)
+    fn host_status(&self) -> (&'static str, Color32) {
+        if !self.settings.host {
+            ("不允许被控制", kit::GRAY)
+        } else if self.host.running() {
+            ("可被控制", kit::GREEN)
+        } else if self.host.error.is_some() || !self.host.installed() {
+            ("被控端未就绪", kit::ORANGE)
+        } else {
+            ("正在启动…", kit::GRAY)
+        }
+    }
+
+    fn nav_item(
+        &mut self,
+        ui: &mut egui::Ui,
+        page: Page,
+        label: &str,
+        icon: fn(&egui::Painter, egui::Rect, Color32),
+    ) {
+        let (rect, resp) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::click());
+        let selected = self.page == page;
+        let p = ui.painter();
+        if selected {
+            p.rect_filled(rect, 10, Color32::WHITE);
+            p.rect_stroke(rect, 10, (1.0, kit::BORDER), egui::StrokeKind::Inside);
+        } else if resp.hovered() {
+            p.rect_filled(rect, 10, Color32::from_rgb(0xE2, 0xE2, 0xE6));
+        }
+        let color = if selected {
+            kit::TEXT
+        } else {
+            kit::TEXT_WEAK
+        };
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 22.0, rect.center().y),
+            Vec2::splat(18.0),
+        );
+        icon(p, icon_rect, color);
+        p.text(
+            egui::pos2(rect.left() + 42.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(14.5),
+            if selected { kit::TEXT } else { kit::TEXT_WEAK },
+        );
+        if resp
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            self.page = page;
+        }
+        ui.add_space(2.0);
+    }
+
+    fn page_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
+        ui.label(RichText::new(title).size(24.0).strong().color(kit::TEXT));
+        ui.label(RichText::new(subtitle).size(13.0).color(kit::TEXT_WEAK));
+    }
+
+    fn section_label(ui: &mut egui::Ui, text: &str) {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(text)
+                .size(13.0)
+                .strong()
+                .color(kit::TEXT_WEAK),
+        );
+        ui.add_space(2.0);
+    }
+
+    fn devices_page(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                Self::page_header(
+                    ui,
+                    "设备",
+                    "同一局域网中打开了 SuperControl 的电脑会自动出现在这里",
+                )
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let go = kit::secondary_button(ui, "连接").clicked();
+                let edit = egui::TextEdit::singleline(&mut self.manual_addr)
+                    .hint_text("输入对方 IP 地址")
+                    .desired_width(160.0)
+                    .margin(Margin::symmetric(10, 7));
+                let resp = ui.add(edit);
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (go || enter) && !self.busy() && !self.manual_addr.trim().is_empty() {
+                    match net::parse_addr(self.manual_addr.trim()) {
+                        Ok(addr) => {
+                            let name = self.manual_addr.trim().to_string();
+                            self.connect(&ctx, name, None, addr, None);
+                        }
+                        Err(e) => self.say(format!("地址无效：{e:#}"), true),
+                    }
+                }
+            });
+        });
+        ui.add_space(14.0);
+
+        // 正在控制的连接
+        if !self.sessions.is_empty() {
+            Self::section_label(ui, "正在控制");
+            let mut kill = None;
+            for (i, s) in self.sessions.iter().enumerate() {
+                kit::card()
+                    .inner_margin(Margin::symmetric(16, 12))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            kit::chip(ui, "已连接", kit::GREEN);
+                            ui.label(RichText::new(&s.name).size(14.5).strong().color(kit::TEXT));
+                            ui.label(
+                                RichText::new("远程画面已在独立窗口中打开")
+                                    .size(12.0)
+                                    .color(kit::TEXT_WEAK),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if kit::secondary_button(ui, "断开").clicked() {
+                                        kill = Some(i);
+                                    }
+                                },
+                            );
+                        });
+                    });
+            }
+            if let Some(i) = kill {
+                let mut s = self.sessions.remove(i);
+                let _ = s.child.kill();
+                let _ = s.child.wait();
+            }
+            ui.add_space(8.0);
+        }
+
+        let cards = self.device_cards();
+        let online = cards.iter().filter(|c| c.online).count();
+        Self::section_label(ui, &format!("局域网中的设备 · {online} 台在线"));
+        if cards.is_empty() {
+            Self::empty_state(ui);
+            return;
+        }
+
+        let gap = 14.0;
+        let width = ui.available_width();
+        let cols = (((width + gap) / (260.0 + gap)).floor() as usize).clamp(1, 3);
+        let card_w = (width - gap * (cols as f32 - 1.0)) / cols as f32;
+        let busy = self.busy();
+        let mut action = None;
+        let mut forget = None;
+        for row in cards.chunks(cols) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for c in row {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(card_w, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            let (connect, forget_it) = device_card(ui, c, card_w, busy);
+                            if connect {
+                                if let Some((id, addr, os)) = &c.target {
+                                    action = Some((c.name.clone(), *id, *addr, os.clone()));
+                                }
+                            }
+                            if forget_it {
+                                forget = c.forget_id.clone();
+                            }
+                        },
+                    );
+                }
+            });
+            ui.add_space(gap - 8.0);
+        }
+        if let Some((name, id, addr, os)) = action {
+            self.connect(&ctx, name, id, addr, os);
+        }
+        if let Some(id) = forget {
+            let _ = config::forget(&id);
+            self.say("已删除配对信息，下次连接需要重新配对", false);
+        }
+    }
+
+    /// 在线设备 + 配对过但当前不在线的设备。
+    fn device_cards(&self) -> Vec<CardInfo> {
+        let now = Instant::now();
+        let mut online: Vec<net::Discovered> = {
+            let seen = self.seen.lock().unwrap();
+            seen.values()
+                .filter(|s| now - s.at < Duration::from_secs(8))
+                .map(|s| s.host.clone())
+                .collect()
+        };
+        online.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut cards: Vec<CardInfo> = online
+            .iter()
+            .map(|d| CardInfo {
+                name: d.name.clone(),
+                os: d.os.clone(),
+                addr: d.addr.ip().to_string(),
+                online: true,
+                paired: d.paired,
+                compatible: d.version == proto::PROTOCOL_VERSION,
+                target: Some((Some(d.host_id), d.addr, Some(d.os.clone()))),
+                forget_id: d.paired.then(|| proto::hex(&d.host_id)),
+            })
+            .collect();
+        for k in config::known_hosts() {
+            if online.iter().any(|d| proto::hex(&d.host_id) == k.id) {
+                continue;
+            }
+            let addr = k.last_addr.clone().unwrap_or_default();
+            let parsed = addr.parse::<SocketAddr>().ok();
+            cards.push(CardInfo {
+                name: k.name.clone(),
+                os: String::new(),
+                addr: parsed.map(|a| a.ip().to_string()).unwrap_or(addr),
+                online: false,
+                paired: true,
+                compatible: true,
+                target: parsed.map(|a| (proto::parse_hex16(&k.id), a, None)),
+                forget_id: Some(k.id.clone()),
+            });
+        }
+        cards
+    }
+
+    fn empty_state(ui: &mut egui::Ui) {
+        kit::card()
+            .inner_margin(Margin::symmetric(24, 32))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.vertical_centered(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
+                    ui.painter().rect_filled(rect, 18, kit::FILL);
+                    kit::icon_monitor(ui.painter(), rect.shrink(14.0), kit::TEXT);
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let w = 220.0;
+                        ui.add_space(((ui.available_width() - w) / 2.0).max(0.0));
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("正在寻找局域网中的设备…")
+                                .size(15.0)
+                                .strong()
+                                .color(kit::TEXT),
+                        );
+                    });
+                    ui.add_space(4.0);
+                    for line in [
+                        "在另一台电脑上也打开 SuperControl",
+                        "两台电脑需要连接同一个路由器（局域网）",
+                        "找不到时，可以在右上角直接输入对方的 IP 地址",
+                    ] {
+                        ui.label(RichText::new(line).size(12.5).color(kit::TEXT_WEAK));
+                    }
+                });
+            });
+    }
+
+    fn settings_page(&mut self, ui: &mut egui::Ui) {
+        Self::page_header(ui, "设置", "调整控制方式、被控制选项和网络");
+        ui.add_space(14.0);
+
+        // ---- 控制其他电脑 ----
+        Self::section_label(ui, "控制其他电脑");
+        let mut changed = false;
+        kit::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let (title, desc) = if cfg!(target_os = "macos") {
+                ("Command 键当作 Ctrl", "⌘C / ⌘V 即可在 Windows 上复制粘贴")
+            } else {
+                (
+                    "控制 Mac 时 Ctrl 当作 Command",
+                    "Ctrl+C / Ctrl+V 即可在 Mac 上复制粘贴",
+                )
+            };
+            kit::setting_row(ui, title, desc, 60.0, |ui| {
+                changed |= ui.add(Toggle(&mut self.settings.cmd_as_ctrl)).changed()
+            });
+            kit::divider(ui);
+            kit::setting_row(
+                ui,
+                "播放远端的声音",
+                "对方电脑的声音在本机播放",
+                60.0,
+                |ui| changed |= ui.add(Toggle(&mut self.settings.audio)).changed(),
+            );
+            kit::divider(ui);
+            kit::setting_row(
+                ui,
+                "按原始分辨率传输",
+                "默认按窗口大小编码：看起来一样清晰，延迟和带宽更低",
+                60.0,
+                |ui| changed |= ui.add(Toggle(&mut self.settings.native)).changed(),
+            );
+        });
+        if changed {
+            let _ = config::save_settings(&self.settings);
+        }
+
+        // ---- 被控制 ----
+        ui.add_space(10.0);
+        Self::section_label(ui, "被控制");
+        kit::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let mut on = self.settings.host;
+            let (text, dot) = self.host_status();
+            kit::setting_row(ui, "允许其他设备控制这台电脑", "只在 SuperControl 打开期间可被控制；新设备第一次连接时，需要在这台电脑上确认配对码", 200.0, |ui| {
+                if ui.add(Toggle(&mut on)).changed() {
+                    self.settings.host = on;
+                    let _ = config::save_settings(&self.settings);
+                    self.host.error = None;
+                    self.host.next_try = Instant::now();
+                }
+                kit::chip(ui, text, dot);
+            });
+            self.host_platform_ui(ui);
+            if let Some(e) = &self.host.error {
+                ui.add_space(4.0);
+                ui.label(RichText::new(e).size(12.0).color(kit::ORANGE));
             }
         });
-        self.host_platform_ui(ui);
-        if let Some(e) = &self.host.error {
-            ui.label(RichText::new(e).small().color(Color32::from_rgb(200, 120, 0)));
+
+        // ---- 网络（macOS） ----
+        if cfg!(target_os = "macos") {
+            ui.add_space(10.0);
+            Self::section_label(ui, "网络");
+            kit::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let mut guard = self.awdl_guard;
+                let pending = self.awdl_job.is_some();
+                kit::setting_row(
+                    ui,
+                    "远程期间自动关闭 AWDL",
+                    "AWDL 是隔空投送、接力使用的无线通道，会让 Wi-Fi 周期性卡顿几十毫秒。只在远程画面打开期间关闭；第一次开启需要输入一次管理员密码",
+                    200.0,
+                    |ui| {
+                        let resp = ui.add_enabled(!pending, Toggle(&mut guard));
+                        if pending {
+                            ui.spinner();
+                        }
+                        if resp.changed() {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            self.awdl_job = Some(rx);
+                            std::thread::spawn(move || {
+                                let _ = tx.send(awdl::set_enabled(guard).map_err(|e| format!("{e:#}")));
+                            });
+                        }
+                        if self.awdl_active {
+                            kit::chip(ui, "AWDL 开启中", kit::ORANGE);
+                        } else {
+                            kit::chip(ui, "AWDL 已关闭", kit::GREEN);
+                        }
+                    },
+                );
+            });
         }
+
+        ui.add_space(16.0);
+        ui.label(
+            RichText::new(format!(
+                "SuperControl {} · 协议版本 {}",
+                env!("CARGO_PKG_VERSION"),
+                proto::PROTOCOL_VERSION
+            ))
+            .size(12.0)
+            .color(kit::TEXT_FAINT),
+        );
     }
 
     #[cfg(windows)]
     fn host_platform_ui(&mut self, ui: &mut egui::Ui) {
         use crate::winhost;
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("被控端服务：{}", winhost::state_text(self.host.state))).small().weak());
-            let (label, args) = if self.host.state.is_some() { ("重新安装", "install") } else { ("安装", "install") };
-            if ui.small_button(label).on_hover_text("需要管理员权限（会弹出确认），只需安装一次。安装后可以控制锁屏和 UAC 界面").clicked() {
-                if let Err(e) = winhost::run_elevated(args) {
-                    self.message = Some((format!("{e:#}"), true));
+        kit::divider(ui);
+        let installed = self.host.state.is_some();
+        let desc = if installed {
+            "已安装，可以控制锁屏、登录界面和 UAC 弹窗"
+        } else {
+            "需要安装一次（会请求管理员权限）。安装后可以控制锁屏、登录界面和 UAC 弹窗"
+        };
+        let mut result = Ok(());
+        kit::setting_row(ui, "被控端服务", desc, 240.0, |ui| {
+            if installed {
+                if kit::text_button(ui, "卸载", kit::TEXT_WEAK).clicked() {
+                    result = winhost::run_elevated("uninstall");
                 }
-            }
-            if self.host.state.is_some() && ui.small_button("卸载").clicked() {
-                if let Err(e) = winhost::run_elevated("uninstall") {
-                    self.message = Some((format!("{e:#}"), true));
+                if kit::secondary_button(ui, "重新安装").clicked() {
+                    result = winhost::run_elevated("install");
                 }
+                kit::chip(ui, winhost::state_text(self.host.state), kit::GRAY);
+            } else if kit::primary_button(ui, "安装", true).clicked() {
+                result = winhost::run_elevated("install");
             }
         });
+        if let Err(e) = result {
+            self.say(format!("{e:#}"), true);
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -445,46 +919,231 @@ impl Gui {
         if !self.settings.host {
             return;
         }
-        ui.label(RichText::new("首次使用需要在系统设置中允许 RemoteControl 使用以下两项权限，授权后重新打开本程序：").small().weak());
-        ui.horizontal(|ui| {
-            if ui.small_button("录屏与系统录音…").clicked() {
-                let _ = Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture").spawn();
-            }
-            if ui.small_button("辅助功能…").clicked() {
-                let _ = Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility").spawn();
-            }
-        });
+        kit::divider(ui);
+        kit::setting_row(
+            ui,
+            "系统权限",
+            "需要允许 SuperControl 使用「录屏与系统录音」和「辅助功能」，授权后重新打开本程序",
+            220.0,
+            |ui| {
+                if kit::secondary_button(ui, "辅助功能").clicked() {
+                    let _ = Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility").spawn();
+                }
+                if kit::secondary_button(ui, "录屏").clicked() {
+                    let _ = Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture").spawn();
+                }
+            },
+        );
         // 被控端日志里最近的权限 / 错误提示
-        if let Some(line) = hostagent::log_tail(30).into_iter().rev().find(|l| l.contains("权限") || l.contains("失败")) {
-            ui.label(RichText::new(line).small().color(Color32::from_rgb(200, 120, 0)));
+        if let Some(line) = hostagent::log_tail(30)
+            .into_iter()
+            .rev()
+            .find(|l| l.contains("权限") || l.contains("失败"))
+        {
+            ui.add_space(4.0);
+            ui.label(RichText::new(line).size(12.0).color(kit::ORANGE));
         }
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]
     fn host_platform_ui(&mut self, _ui: &mut egui::Ui) {}
+
+    /// 底部提示条。
+    fn toast(&mut self, ctx: &egui::Context) {
+        let Some((text, error, _)) = self.message.clone() else {
+            return;
+        };
+        // 黑底白字；错误时文字前加红点
+        let (fg, bg) = (Color32::WHITE, kit::BLACK);
+        let mut close = false;
+        egui::Area::new(egui::Id::unique("toast"))
+            .anchor(egui::Align2::CENTER_BOTTOM, [105.0, -20.0])
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(bg)
+                    .corner_radius(12)
+                    .inner_margin(Margin::symmetric(14, 10))
+                    .shadow(egui::Shadow {
+                        offset: [0, 4],
+                        blur: 16,
+                        spread: 0,
+                        color: Color32::from_black_alpha(25),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_max_width(520.0);
+                        ui.horizontal(|ui| {
+                            if error {
+                                let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                                ui.painter().circle_filled(r.center(), 4.0, kit::RED);
+                            }
+                            ui.add(
+                                egui::Label::new(RichText::new(&text).size(13.0).color(fg)).wrap(),
+                            );
+                            if kit::text_button(ui, "✕", kit::TEXT_FAINT).clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+            });
+        if close {
+            self.message = None;
+        }
+    }
+
+    /// 连接 / 配对进度对话框。
+    fn job_dialog(&mut self, ctx: &egui::Context) {
+        let status = self.job.as_ref().and_then(|j| match &*j.lock().unwrap() {
+            Job::Connecting { name } => Some((name.clone(), None)),
+            Job::Pairing { name, code } => Some((name.clone(), Some(code.clone()))),
+            _ => None,
+        });
+        let Some((name, code)) = status else { return };
+        egui::Modal::new(egui::Id::unique("connecting"))
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::WHITE)
+                    .corner_radius(16)
+                    .inner_margin(Margin::same(24)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                match code {
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new(format!("正在连接「{name}」…"))
+                                    .size(15.0)
+                                    .color(kit::TEXT),
+                            );
+                        });
+                    }
+                    Some(code) => {
+                        ui.label(
+                            RichText::new(format!("与「{name}」配对"))
+                                .size(18.0)
+                                .strong()
+                                .color(kit::TEXT),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "第一次连接需要配对。请在对方屏幕上核对配对码，一致后点“允许”。",
+                            )
+                            .size(13.0)
+                            .color(kit::TEXT_WEAK),
+                        );
+                        ui.add_space(14.0);
+                        let digits: Vec<char> = code.chars().collect();
+                        let (box_w, gap) = (44.0, 8.0);
+                        let total = digits.len() as f32 * box_w
+                            + (digits.len().saturating_sub(1)) as f32 * gap;
+                        let (rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 56.0),
+                            Sense::hover(),
+                        );
+                        let mut x = rect.center().x - total / 2.0;
+                        for d in digits {
+                            let r = egui::Rect::from_min_size(
+                                egui::pos2(x, rect.top()),
+                                Vec2::new(box_w, 56.0),
+                            );
+                            ui.painter().rect_filled(r, 10, kit::FILL);
+                            ui.painter().text(
+                                r.center(),
+                                egui::Align2::CENTER_CENTER,
+                                d,
+                                egui::FontId::proportional(28.0),
+                                kit::TEXT,
+                            );
+                            x += box_w + gap;
+                        }
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new("等待对方确认（60 秒内）…")
+                                    .size(13.0)
+                                    .color(kit::TEXT_WEAK),
+                            );
+                        });
+                        ui.label(
+                            RichText::new("配对一次后，以后可以直接连接。")
+                                .size(12.0)
+                                .color(kit::TEXT_FAINT),
+                        );
+                    }
+                }
+            });
+    }
 }
 
-fn device_row(ui: &mut egui::Ui, name: &str, os: &str, addr: &str, badge: &str, good: bool, buttons: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::group(ui.style()).inner_margin(10).show(ui, |ui| {
-        ui.set_width(ui.available_width());
+/// 设备卡片。返回 (点了连接, 点了忘记)。
+fn device_card(ui: &mut egui::Ui, c: &CardInfo, width: f32, busy: bool) -> (bool, bool) {
+    let (mut connect, mut forget) = (false, false);
+    kit::card().show(ui, |ui| {
+        ui.set_width(width - 34.0);
         ui.horizontal(|ui| {
-            let icon = match os {
-                "windows" => "🖥",
-                "macos" => "💻",
-                _ => "💻",
-            };
-            ui.label(RichText::new(icon).size(22.0));
+            kit::device_tile(ui, &c.os, 46.0, c.online);
             ui.vertical(|ui| {
-                ui.label(RichText::new(name).strong().size(15.0));
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(addr).weak().small());
-                    let color = if good { Color32::from_rgb(40, 140, 60) } else { Color32::GRAY };
-                    ui.label(RichText::new(badge).small().color(color));
-                });
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.add(
+                    egui::Label::new(RichText::new(&c.name).size(15.0).strong().color(kit::TEXT))
+                        .truncate(),
+                );
+                let sub = if c.os.is_empty() {
+                    c.addr.clone()
+                } else {
+                    format!("{} · {}", kit::os_label(&c.os), c.addr)
+                };
+                ui.label(RichText::new(sub).size(12.0).color(kit::TEXT_WEAK));
             });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), buttons);
+        });
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if !c.online {
+                kit::chip(ui, "离线", kit::GRAY);
+            } else if !c.compatible {
+                kit::chip(ui, "版本不一致", kit::ORANGE);
+            } else {
+                kit::chip(ui, "在线", kit::GREEN);
+            }
+            if c.paired {
+                kit::chip(ui, "已配对", kit::BLACK);
+            } else {
+                kit::chip(ui, "首次连接需配对", kit::GRAY);
+            }
+        });
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            let enabled = !busy && c.compatible && c.target.is_some();
+            let hint = if !c.compatible {
+                "两台电脑的 SuperControl 版本不一致，请更新到同一版本"
+            } else if !c.online {
+                "对方当前不在线，将按上次的地址尝试连接"
+            } else {
+                "打开远程画面"
+            };
+            let label = if c.online { "连接" } else { "尝试连接" };
+            if kit::primary_button(ui, label, enabled)
+                .on_hover_text(hint)
+                .clicked()
+            {
+                connect = true;
+            }
+            if c.forget_id.is_some() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if kit::text_button(ui, "忘记", kit::TEXT_FAINT)
+                        .on_hover_text("删除本机保存的配对信息")
+                        .clicked()
+                    {
+                        forget = true;
+                    }
+                });
+            }
         });
     });
+    (connect, forget)
 }
 
 impl eframe::App for Gui {
@@ -497,113 +1156,52 @@ impl eframe::App for Gui {
         let ctx = ui.ctx().clone();
         ctx.request_repaint_after(Duration::from_millis(500));
 
-        egui::CentralPanel::default().frame(egui::Frame::central_panel(ui.style()).inner_margin(18)).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading("RemoteControl");
-                ui.label(RichText::new(format!("本机：{}", self.device_name)).weak());
-                ui.add_space(12.0);
-
-                ui.label(RichText::new("局域网中的设备").strong());
-                ui.add_space(4.0);
-                self.device_list(ui);
-
-                ui.add_space(12.0);
-                ui.label(RichText::new("手动连接").strong());
-                ui.horizontal(|ui| {
-                    let edit = egui::TextEdit::singleline(&mut self.manual_addr).hint_text("IP 地址，如 192.168.1.14").desired_width(240.0);
-                    let resp = ui.add(edit);
-                    let go = ui.add_enabled(!self.busy() && !self.manual_addr.trim().is_empty(), egui::Button::new("连接")).clicked()
-                        || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                    if go {
-                        match net::parse_addr(self.manual_addr.trim()) {
-                            Ok(addr) => {
-                                let name = self.manual_addr.trim().to_string();
-                                self.connect(&ctx, name, None, addr, None);
-                            }
-                            Err(e) => self.message = Some((format!("地址无效：{e:#}"), true)),
+        egui::Panel::left("nav")
+            .exact_size(210.0)
+            .resizable(false)
+            .frame(egui::Frame::new().fill(kit::SIDEBAR).inner_margin(Margin {
+                left: 14,
+                right: 14,
+                top: 20,
+                bottom: 14,
+            }))
+            .show(ui, |ui| {
+                egui::Panel::bottom("local").frame(egui::Frame::new()).resizable(false).show(ui, |ui| self.local_card(ui));
+                self.sidebar(ui);
+            });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(kit::BG).inner_margin(Margin {
+                left: 28,
+                right: 28,
+                top: 24,
+                bottom: 8,
+            }))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        match self.page {
+                            Page::Devices => self.devices_page(ui),
+                            Page::Settings => self.settings_page(ui),
                         }
-                    }
-                });
-
-                ui.add_space(12.0);
-                ui.label(RichText::new("设置").strong());
-                self.settings_ui(ui);
-
-                ui.add_space(12.0);
-                ui.label(RichText::new("被控制").strong());
-                self.host_ui(ui);
-
-                if !self.sessions.is_empty() {
-                    ui.add_space(12.0);
-                    ui.label(RichText::new("正在控制").strong());
-                    let mut kill = None;
-                    for (i, s) in self.sessions.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.label(&s.name);
-                            if ui.small_button("断开").clicked() {
-                                kill = Some(i);
-                            }
-                        });
-                    }
-                    if let Some(i) = kill {
-                        let mut s = self.sessions.remove(i);
-                        let _ = s.child.kill();
-                        let _ = s.child.wait();
-                    }
-                }
-
-                if let Some((text, error)) = &self.message {
-                    ui.add_space(12.0);
-                    let color = if *error { Color32::from_rgb(190, 40, 40) } else { Color32::from_rgb(40, 140, 60) };
-                    ui.label(RichText::new(text).color(color));
-                }
+                        ui.add_space(60.0); // 给底部提示条留位置
+                    });
             });
-        });
 
-        // 连接 / 配对进度
-        let status = self.job.as_ref().and_then(|j| match &*j.lock().unwrap() {
-            Job::Connecting { name } => Some((name.clone(), None)),
-            Job::Pairing { name, code } => Some((name.clone(), Some(code.clone()))),
-            _ => None,
-        });
-        if let Some((name, code)) = status {
-            egui::Modal::new(egui::Id::unique("connecting")).show(&ctx, |ui| {
-                ui.set_width(340.0);
-                match code {
-                    None => {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(format!("正在连接「{name}」…"));
-                        });
-                    }
-                    Some(code) => {
-                        ui.label(RichText::new(format!("与「{name}」配对")).strong().size(16.0));
-                        ui.add_space(6.0);
-                        ui.label("请在对方屏幕上核对配对码，一致后点“是”：");
-                        ui.add_space(6.0);
-                        ui.vertical_centered(|ui| {
-                            ui.label(RichText::new(code).monospace().size(36.0).strong());
-                        });
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(RichText::new("等待对方确认（60 秒内）…").weak());
-                        });
-                        ui.label(RichText::new("配对一次后，以后可直接连接。").weak().small());
-                    }
-                }
-            });
-        }
+        self.toast(&ctx);
+        self.job_dialog(&ctx);
 
         if let Some((path, at)) = &self.screenshot {
             if at.elapsed() > Duration::from_secs(2) {
                 let path = path.clone();
                 self.screenshot = None;
                 let c = ctx.clone();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |img| {
-                    let _ = save_png(&path, &img);
-                    c.send_viewport_cmd(egui::ViewportCommand::Close);
-                })));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                    egui::ScreenshotCallback::new(move |img| {
+                        let _ = save_png(&path, &img);
+                        c.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }),
+                ));
             }
         }
     }
@@ -615,9 +1213,16 @@ fn spawn_scanner(seen: Arc<Mutex<HashMap<DeviceId, Seen>>>, ctx: egui::Context) 
         if let Ok(found) = net::discover(Duration::from_millis(700)) {
             let now = Instant::now();
             // 本机自己的被控端不显示
-            let local: Vec<std::net::IpAddr> = if_addrs::get_if_addrs().unwrap_or_default().iter().map(|i| i.ip()).collect();
+            let local: Vec<std::net::IpAddr> = if_addrs::get_if_addrs()
+                .unwrap_or_default()
+                .iter()
+                .map(|i| i.ip())
+                .collect();
             let mut map = seen.lock().unwrap();
-            for host in found.into_iter().filter(|h| !h.addr.ip().is_loopback() && !local.contains(&h.addr.ip())) {
+            for host in found
+                .into_iter()
+                .filter(|h| !h.addr.ip().is_loopback() && !local.contains(&h.addr.ip()))
+            {
                 map.insert(host.host_id, Seen { host, at: now });
             }
             map.retain(|_, s| now - s.at < Duration::from_secs(30));
@@ -629,7 +1234,12 @@ fn spawn_scanner(seen: Arc<Mutex<HashMap<DeviceId, Seen>>>, ctx: egui::Context) 
 }
 
 /// 启动远程画面窗口进程。
-fn spawn_viewer(name: &str, addr: SocketAddr, settings: &config::Settings, host_os: Option<&str>) -> Result<Session> {
+fn spawn_viewer(
+    name: &str,
+    addr: SocketAddr,
+    settings: &config::Settings,
+    host_os: Option<&str>,
+) -> Result<Session> {
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("view").arg(addr.to_string());
     // Mac 控制任何系统时都按习惯互换；Windows 只在控制 Mac 时互换（控制 Windows 时 Ctrl 就是 Ctrl）
@@ -647,7 +1257,11 @@ fn spawn_viewer(name: &str, addr: SocketAddr, settings: &config::Settings, host_
     if !settings.audio {
         cmd.arg("--no-audio");
     }
-    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
     let stderr = Arc::new(Mutex::new(Vec::new()));
     if let Some(pipe) = child.stderr.take() {
         let lines = stderr.clone();
@@ -661,7 +1275,11 @@ fn spawn_viewer(name: &str, addr: SocketAddr, settings: &config::Settings, host_
             }
         });
     }
-    Ok(Session { name: name.to_string(), child, stderr })
+    Ok(Session {
+        name: name.to_string(),
+        child,
+        stderr,
+    })
 }
 
 fn save_png(path: &str, img: &egui::ColorImage) -> Result<()> {
@@ -669,7 +1287,11 @@ fn save_png(path: &str, img: &egui::ColorImage) -> Result<()> {
     let mut enc = png::Encoder::new(file, img.size[0] as u32, img.size[1] as u32);
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);
-    let rgba: Vec<u8> = img.pixels.iter().flat_map(|p| p.to_srgba_unmultiplied()).collect();
+    let rgba: Vec<u8> = img
+        .pixels
+        .iter()
+        .flat_map(|p| p.to_srgba_unmultiplied())
+        .collect();
     enc.write_header()?.write_image_data(&rgba)?;
     Ok(())
 }

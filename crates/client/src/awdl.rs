@@ -48,7 +48,7 @@ fn run_privileged(action: &str, arg: &str) -> Result<()> {
     let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
     let cmd = format!("/bin/bash {} {action} {}", q(&script.display().to_string()), q(arg));
     let apple = format!(
-        "do shell script \"{}\" with prompt \"RemoteControl 需要管理员权限来设置 AWDL 自动处理。\" with administrator privileges",
+        "do shell script \"{}\" with prompt \"SuperControl 需要管理员权限来设置 AWDL 自动处理。\" with administrator privileges",
         cmd.replace('\\', "\\\\").replace('"', "\\\"")
     );
     let out = Command::new("osascript").args(["-e", &apple]).output().context("运行 osascript")?;

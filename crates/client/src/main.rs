@@ -29,6 +29,8 @@ mod awdl {
 #[cfg(any(target_os = "macos", windows))]
 mod config;
 #[cfg(any(target_os = "macos", windows))]
+mod ui_kit;
+#[cfg(any(target_os = "macos", windows))]
 mod datalink;
 #[cfg(target_os = "macos")]
 #[path = "display_mac.rs"]
@@ -158,6 +160,29 @@ mod app {
 
     enum UserEvent {
         Disconnected,
+        Cursor(rc_protocol::CursorShape),
+    }
+
+    /// 被控端光标形状 → 本地系统光标；`None` 表示隐藏本地光标。
+    fn cursor_icon(shape: rc_protocol::CursorShape) -> Option<winit::window::CursorIcon> {
+        use rc_protocol::CursorShape as S;
+        use winit::window::CursorIcon as C;
+        Some(match shape {
+            S::Arrow => C::Default,
+            S::Text => C::Text,
+            S::Hand => C::Pointer,
+            S::Wait => C::Wait,
+            S::Progress => C::Progress,
+            S::Crosshair => C::Crosshair,
+            S::ResizeNS => C::NsResize,
+            S::ResizeEW => C::EwResize,
+            S::ResizeNWSE => C::NwseResize,
+            S::ResizeNESW => C::NeswResize,
+            S::Move => C::Move,
+            S::NotAllowed => C::NotAllowed,
+            S::Help => C::Help,
+            S::Hidden | S::InVideo => return None,
+        })
     }
 
     struct App {
@@ -270,10 +295,17 @@ mod app {
                 }
                 Err(e) => eprintln!("数据通道不可用（剪贴板与文件传输不可用）: {e:#}"),
             }
-            let proxy = self.proxy.clone();
-            net::spawn_control_reader(conn.tcp, self.shared.clone(), move || {
-                let _ = proxy.send_event(UserEvent::Disconnected);
-            });
+            let (proxy, cursor_proxy) = (self.proxy.clone(), self.proxy.clone());
+            net::spawn_control_reader(
+                conn.tcp,
+                self.shared.clone(),
+                move |shape| {
+                    let _ = cursor_proxy.send_event(UserEvent::Cursor(shape));
+                },
+                move || {
+                    let _ = proxy.send_event(UserEvent::Disconnected);
+                },
+            );
             net::spawn_pinger(control.clone(), self.shared.clone());
             let (title_window, host, print_stats) = (window.clone(), self.host_name.clone(), self.args.stats);
             let shared = self.shared.clone();
@@ -410,6 +442,20 @@ mod app {
                 UserEvent::Disconnected => {
                     eprintln!("连接已断开");
                     event_loop.exit();
+                }
+                UserEvent::Cursor(shape) => {
+                    if self.args.stats {
+                        println!("光标: {shape:?}");
+                    }
+                    if let Some(window) = &self.window {
+                        match cursor_icon(shape) {
+                            Some(icon) => {
+                                window.set_cursor(icon);
+                                window.set_cursor_visible(true);
+                            }
+                            None => window.set_cursor_visible(false),
+                        }
+                    }
                 }
             }
         }

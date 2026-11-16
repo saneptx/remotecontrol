@@ -16,6 +16,10 @@ pub trait VideoSource {
     fn notice(&self) -> Option<String> {
         None
     }
+    /// 当前光标形状（每帧查询一次，变化时发给控制端）。`None` 表示不支持。
+    fn cursor(&mut self) -> Option<rc_protocol::CursorShape> {
+        None
+    }
     /// 控制端窗口像素尺寸变化（已去抖）。`(0, 0)` 表示原始分辨率。
     fn set_viewport(&mut self, _width: u32, _height: u32) -> Result<()> {
         Ok(())

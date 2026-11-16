@@ -22,7 +22,7 @@ pub fn ask_pairing(client: &str, peer: &str, code: &str) -> bool {
     let text = wide(&format!(
         "「{client}」（{peer}）请求远程控制这台电脑。\n\n配对码：{code}\n请确认与控制端屏幕上显示的配对码一致。\n\n允许后，该设备以后可以直接连接，无需再次确认。\n（60 秒内未响应将自动拒绝）"
     ));
-    let title = wide("RemoteControl 配对请求");
+    let title = wide("SuperControl 配对请求");
     std::thread::spawn(move || unsafe {
         let Ok(user32) = libloading::Library::new("user32.dll") else { return false };
         // 未公开但长期稳定存在的 API：带超时的 MessageBox。

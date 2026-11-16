@@ -23,7 +23,7 @@ static ACTIVITY: AtomicU32 = AtomicU32::new(0);
 pub fn init(prevent_sleep: bool) {
     if prevent_sleep {
         let mut id = 0;
-        unsafe { IOPMAssertionCreateWithName(cfstr(c"PreventUserIdleSystemSleep"), 255, cfstr(c"RemoteControl 被控端"), &mut id) };
+        unsafe { IOPMAssertionCreateWithName(cfstr(c"PreventUserIdleSystemSleep"), 255, cfstr(c"SuperControl 被控端"), &mut id) };
         println!("运行期间将阻止系统睡眠（显示器仍可按设置关闭）；如需允许睡眠请加 --allow-sleep");
     }
 }
@@ -31,6 +31,6 @@ pub fn init(prevent_sleep: bool) {
 /// 模拟一次用户活动：点亮显示器并重置空闲计时。
 pub fn wake_display() {
     let mut id = ACTIVITY.load(Ordering::Relaxed);
-    unsafe { IOPMAssertionDeclareUserActivity(cfstr(c"RemoteControl 远程控制"), 0, &mut id) };
+    unsafe { IOPMAssertionDeclareUserActivity(cfstr(c"SuperControl 远程控制"), 0, &mut id) };
     ACTIVITY.store(id, Ordering::Relaxed);
 }

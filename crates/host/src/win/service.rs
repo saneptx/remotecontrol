@@ -12,8 +12,8 @@
 //! 所以界面不需要管理员权限。
 //!
 //! 目录：
-//! - 程序：`%ProgramFiles%\RemoteControl\rc-host.exe`
-//! - 数据：`%ProgramData%\RemoteControl\`（密码与日志；仅 SYSTEM 和管理员可读）
+//! - 程序：`%ProgramFiles%\SuperControl\`（SuperControl.exe 界面 + rc-host.exe 被控端）
+//! - 数据：`%ProgramData%\RemoteControl\`（配对信息与日志；仅 SYSTEM 和管理员可读。沿用旧名以保留配对）
 
 use crate::Args;
 use anyhow::{bail, Context, Result};
@@ -49,7 +49,7 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 
 pub const SERVICE_NAME: &str = "RemoteControlHost";
-const DISPLAY_NAME: &str = "RemoteControl 被控端";
+const DISPLAY_NAME: &str = "SuperControl 被控端";
 const DESCRIPTION: &str = "局域网远程控制被控端：采集屏幕并接受远程键鼠操作，可控制锁屏与 UAC 界面。";
 const FIREWALL_RULE: &str = "RemoteControlHost";
 const NO_SESSION: u32 = u32::MAX;
@@ -58,7 +58,24 @@ const SERVICE_SDDL: &str =
     "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPWPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)";
 
 fn program_dir() -> PathBuf {
-    PathBuf::from(std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into())).join("RemoteControl")
+    PathBuf::from(std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into())).join("SuperControl")
+}
+
+/// 旧版本的程序目录（改名前），安装时清理。
+fn legacy_program_dir() -> PathBuf {
+    program_dir().with_file_name("RemoteControl")
+}
+
+/// 开始菜单里的快捷方式（所有用户）。
+fn start_menu_link() -> PathBuf {
+    PathBuf::from(std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into()))
+        .join(r"Microsoft\Windows\Start Menu\Programs\SuperControl.lnk")
+}
+
+/// 界面程序：发布包里叫 SuperControl.exe（开发时可能还是 rc-client.exe）。
+fn client_exe_beside(exe: &Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    ["SuperControl.exe", "rc-client.exe"].iter().map(|n| dir.join(n)).find(|p| p.exists())
 }
 
 pub fn data_dir() -> PathBuf {
@@ -226,7 +243,7 @@ fn supervise(args: &Args, stop: &mpsc::Receiver<()>) {
         } else {
             let since = *ui_gone_since.get_or_insert_with(Instant::now);
             if started.elapsed() > Duration::from_secs(20) && since.elapsed() > Duration::from_secs(3) {
-                log("RemoteControl 界面程序没有运行，服务自行停止");
+                log("SuperControl 界面程序没有运行，服务自行停止");
                 break;
             }
         }
@@ -477,6 +494,27 @@ pub fn install(args: &Args) -> Result<()> {
     if !same_path(&me, &exe) {
         copy_exe(&me, &exe)?;
     }
+    // 界面程序一起装进去，并在开始菜单放一个快捷方式
+    let client = dir.join("SuperControl.exe");
+    if let Some(src) = client_exe_beside(&me) {
+        if !same_path(&src, &client) {
+            copy_exe(&src, &client)?;
+        }
+    }
+    if client.exists() {
+        let link = start_menu_link();
+        powershell(&format!(
+            "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{}'); $s.TargetPath = '{}'; $s.WorkingDirectory = '{}'; $s.Save()",
+            link.display(),
+            client.display(),
+            dir.display()
+        ));
+    }
+    // 改名前的旧目录（RemoteControl）
+    let legacy = legacy_program_dir();
+    if legacy.exists() && !me.starts_with(&legacy) {
+        let _ = std::fs::remove_dir_all(&legacy);
+    }
 
     // 2. 数据目录只允许 SYSTEM 与管理员访问（用 SID，避免本地化组名的问题）。
     let data = data_dir();
@@ -543,7 +581,7 @@ pub fn install(args: &Args) -> Result<()> {
     service.start(&[] as &[&OsStr]).context("启动服务失败")?;
 
     println!("已安装系统服务「{DISPLAY_NAME}」。");
-    println!("被控端随 RemoteControl 界面程序一起运行：打开 rc-client.exe 时启动，关闭后自动停止。");
+    println!("被控端随 SuperControl 界面一起运行：打开 SuperControl（开始菜单）时启动，关闭后自动停止。");
     println!();
     println!("  本机名称：{}", args.name.clone().unwrap_or_else(crate::trust::computer_name));
     println!("  端口：    {}", args.port);
@@ -595,12 +633,12 @@ pub fn status() -> Result<()> {
                 }
             }
             if st.current_state != ServiceState::Running {
-                problems.push("服务没有运行：重新双击 install-service.cmd，或在“服务”管理器里启动「RemoteControl 被控端」".into());
+                problems.push("服务没有运行：打开 SuperControl 界面（它会启动服务），确认“允许其他设备控制这台电脑”已勾选".into());
             }
         }
         Err(_) => {
             println!("状态：未安装");
-            problems.push("系统服务未安装：双击 install-service.cmd 安装".into());
+            problems.push("系统服务未安装：打开 SuperControl，在“被控制”里点“安装”".into());
         }
     }
 
@@ -712,6 +750,7 @@ pub fn uninstall() -> Result<()> {
     netsh(&["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE}")]);
     let _ = std::fs::remove_dir_all(data_dir());
 
+    let _ = std::fs::remove_file(start_menu_link());
     let dir = program_dir();
     let me = std::env::current_exe()?;
     let running_from_install_dir = me.parent().is_some_and(|p| same_path(p, &dir));

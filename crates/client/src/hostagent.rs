@@ -1,5 +1,5 @@
 //! Mac：界面打开期间在后台运行同一应用包里的 rc-host（子进程），界面关闭后它随之退出。
-//! 首次运行时 macOS 会请求“录屏与系统录音”和“辅助功能”权限（记在 RemoteControl 应用上）。
+//! 首次运行时 macOS 会请求“录屏与系统录音”和“辅助功能”权限（记在 SuperControl 应用上）。
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -35,7 +35,7 @@ pub fn remove_legacy_agent() {
 /// 启动被控端子进程，输出写入日志文件。
 pub fn spawn() -> Result<Child> {
     let Some(bin) = host_binary() else {
-        bail!("找不到被控端程序 rc-host，请使用打包好的 RemoteControl.app");
+        bail!("找不到被控端程序 rc-host，请使用打包好的 SuperControl.app");
     };
     let log = log_path();
     std::fs::create_dir_all(log.parent().unwrap())?;
