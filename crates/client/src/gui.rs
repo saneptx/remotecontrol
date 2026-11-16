@@ -74,7 +74,7 @@ impl Gui {
             seen,
             manual_addr: String::new(),
             settings: config::settings(),
-            awdl_guard: awdl::guard_installed(),
+            awdl_guard: awdl::enabled(),
             awdl_active: awdl::active(),
             awdl_checked: Instant::now(),
             awdl_job: None,
@@ -161,7 +161,7 @@ impl Gui {
         if let Some(rx) = &self.awdl_job {
             if let Ok(r) = rx.try_recv() {
                 self.awdl_job = None;
-                self.awdl_guard = awdl::guard_installed();
+                self.awdl_guard = awdl::enabled();
                 if let Err(e) = r {
                     self.message = Some((format!("设置 AWDL 自动处理失败：{e}"), true));
                 }
@@ -262,7 +262,7 @@ impl Gui {
         ui.horizontal(|ui| {
             let resp = ui
                 .add_enabled(!pending, egui::Checkbox::new(&mut guard, "远程期间自动关闭 AWDL"))
-                .on_hover_text("AWDL 是隔空投送、接力使用的无线通道，会让 Wi-Fi 周期性停顿几十毫秒。\n开启后只在远程画面打开期间关闭它，其余时间不受影响。\n首次开启需要输入管理员密码。");
+                .on_hover_text("AWDL 是隔空投送、接力使用的无线通道，会让 Wi-Fi 周期性停顿几十毫秒。\n开启后只在远程画面打开期间关闭它，其余时间不受影响。\n第一次开启需要输入一次管理员密码，之后切换不再需要。");
             if pending {
                 ui.spinner();
             }
@@ -274,18 +274,6 @@ impl Gui {
                 });
             }
         });
-        if self.awdl_guard && !pending && awdl::guard_outdated() {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("已安装的是旧版守护，主界面开着时也会关闭 AWDL。").small().color(Color32::from_rgb(200, 120, 0)));
-                if ui.small_button("更新").clicked() {
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    self.awdl_job = Some(rx);
-                    std::thread::spawn(move || {
-                        let _ = tx.send(awdl::set_enabled(true).map_err(|e| format!("{e:#}")));
-                    });
-                }
-            });
-        }
         let (text, color) = if self.awdl_active {
             ("当前 AWDL：开启", Color32::from_rgb(200, 120, 0))
         } else {
@@ -626,8 +614,10 @@ fn spawn_scanner(seen: Arc<Mutex<HashMap<DeviceId, Seen>>>, ctx: egui::Context) 
     std::thread::spawn(move || loop {
         if let Ok(found) = net::discover(Duration::from_millis(700)) {
             let now = Instant::now();
+            // 本机自己的被控端不显示
+            let local: Vec<std::net::IpAddr> = if_addrs::get_if_addrs().unwrap_or_default().iter().map(|i| i.ip()).collect();
             let mut map = seen.lock().unwrap();
-            for host in found {
+            for host in found.into_iter().filter(|h| !h.addr.ip().is_loopback() && !local.contains(&h.addr.ip())) {
                 map.insert(host.host_id, Seen { host, at: now });
             }
             map.retain(|_, s| now - s.at < Duration::from_secs(30));

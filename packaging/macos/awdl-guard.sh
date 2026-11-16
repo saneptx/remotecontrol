@@ -6,8 +6,11 @@
 # 本脚本安装一个后台守护：只要有远程画面窗口（rc-client view）在运行，就保持 awdl0 关闭；退出后
 # 不再干预（系统会按需重新打开，AirDrop 等功能照常可用）。
 #
+# 守护只需安装一次（需要 root）。带开关文件参数安装时，只有该文件存在才干预——RemoteControl 界面里的
+# 开关就是创建 / 删除这个文件，切换时不需要再输入管理员密码。
+#
 # 用法：
-#   sudo ./awdl-guard.sh install     安装并启动守护（开机自动运行）
+#   sudo ./awdl-guard.sh install [开关文件]   安装并启动守护（开机自动运行；不带开关文件则始终生效）
 #   sudo ./awdl-guard.sh uninstall   卸载并恢复 AWDL
 #   ./awdl-guard.sh status           查看状态
 set -euo pipefail
@@ -27,16 +30,16 @@ case "${1:-}" in
 install)
     need_root install
     mkdir -p "$(dirname "$BIN")"
-    cat > "$BIN" <<'GUARD'
-#!/bin/bash
-# 每秒检查一次：有远程画面窗口在运行且 awdl0 处于开启状态时把它关掉。
+    { printf '#!/bin/bash\nFLAG=%q\n' "${2:-}"; cat <<'GUARD'
+# 每秒检查一次：开关打开（FLAG 为空或文件存在）、有远程画面窗口在运行且 awdl0 处于开启状态时把它关掉。
 while true; do
-    if pgrep -qf "rc-client view" && ifconfig awdl0 2>/dev/null | head -1 | grep -q "<UP"; then
+    if { [ -z "$FLAG" ] || [ -e "$FLAG" ]; } && pgrep -qf "rc-client view" && ifconfig awdl0 2>/dev/null | head -1 | grep -q "<UP"; then
         ifconfig awdl0 down
     fi
     sleep 1
 done
 GUARD
+    } > "$BIN"
     chmod 755 "$BIN"
     cat > "$PLIST" <<PL
 <?xml version="1.0" encoding="UTF-8"?>
