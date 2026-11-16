@@ -23,7 +23,13 @@ pub fn run(background: bool) -> Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("SuperControl")
         .with_inner_size([900.0, 620.0])
-        .with_min_inner_size([680.0, 480.0]);
+        .with_min_inner_size([680.0, 480.0])
+        // 开机自启：窗口一开始就是隐藏的（macOS 上 eframe 不会再把它显示出来）
+        .with_visible(!background);
+    // Windows 上 eframe 画完第一帧总会把窗口显示出来，先放到屏幕外，第二帧再隐藏
+    if cfg!(windows) && background {
+        viewport = viewport.with_position(OFFSCREEN);
+    }
     if let Some((rgba, w, h)) = decode_png(ICON_PNG) {
         viewport = viewport.with_icon(Arc::new(egui::IconData {
             rgba,
@@ -42,6 +48,9 @@ pub fn run(background: bool) -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
+
+/// 后台启动时 Windows 主窗口先放在这里（看不见），隐藏后再挪回屏幕中间。
+const OFFSCREEN: [f32; 2] = [-20000.0, -20000.0];
 
 fn decode_png(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let mut dec = png::Decoder::new(std::io::Cursor::new(bytes));
@@ -97,6 +106,9 @@ enum Job {
 /// 一个正在运行的远程画面窗口进程。
 struct Session {
     name: String,
+    /// 对方的设备 ID（手动输入地址首次配对时可能不知道）
+    host_id: Option<DeviceId>,
+    addr: SocketAddr,
     child: Child,
     /// 子进程 stderr 的最后几行（出错时显示）。
     stderr: Arc<Mutex<Vec<String>>>,
@@ -152,7 +164,10 @@ struct Gui {
     awdl_active: bool,
     awdl_checked: Instant,
     awdl_job: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
-    host: HostRunner,
+    /// 被控端在后台线程里维护（窗口隐藏时界面不刷新，不能靠界面驱动）
+    host: Arc<Mutex<HostRunner>>,
+    /// “允许其他设备控制”开关；托盘菜单直接改它，界面每帧同步到 settings.host
+    host_want: Arc<AtomicBool>,
     job: Option<Arc<Mutex<Job>>>,
     sessions: Vec<Session>,
     /// 底部提示：(内容, 是否错误, 出现时间)
@@ -165,9 +180,9 @@ struct Gui {
     hidden: bool,
     /// 用户选择了退出（不再把关闭窗口当作隐藏）
     quitting: bool,
-    /// 后台启动：第一帧画完后立即隐藏窗口
-    start_hidden: bool,
-    frames: u64,
+    /// Windows 后台启动：窗口还在屏幕外，等第二帧隐藏，下次显示时挪回屏幕中间
+    parked: bool,
+    frames: u32,
     /// 开机自动启动（读自系统的启动项）
     autostart: bool,
 }
@@ -178,13 +193,37 @@ impl Gui {
         kit::load_system_font(ctx);
         let settings = config::settings();
         let (tray_tx, tray_rx) = std::sync::mpsc::channel();
+        let host = Arc::new(Mutex::new(HostRunner::new()));
+        let host_want = Arc::new(AtomicBool::new(settings.host));
+        spawn_host_keeper(host.clone(), host_want.clone());
+        let on_toggle = {
+            let (host, want) = (host.clone(), host_want.clone());
+            move || {
+                // 菜单项已自己切换了勾选，这里跟着翻转并立刻保存、生效
+                let on = !want.fetch_xor(true, Ordering::SeqCst);
+                let mut s = config::settings();
+                s.host = on;
+                let _ = config::save_settings(&s);
+                let mut h = host.lock().unwrap();
+                h.error = None;
+                h.next_try = Instant::now();
+            }
+        };
         let tray = decode_png(ICON_PNG).and_then(|(rgba, _, _)| {
-            crate::tray::Tray::new(&rgba, settings.host, ctx.clone(), tray_tx)
+            crate::tray::Tray::new(&rgba, settings.host, ctx.clone(), tray_tx, on_toggle)
                 .map_err(|e| eprintln!("创建托盘图标失败: {e:#}"))
                 .ok()
         });
         let seen = Arc::new(Mutex::new(HashMap::new()));
         spawn_scanner(seen.clone(), ctx.clone());
+        if background {
+            if tray.is_some() {
+                crate::tray::set_dock_visible(false);
+            } else {
+                // 托盘图标没建起来就没有入口可以打开窗口，只好直接显示
+                crate::tray::native_show();
+            }
+        }
         let logo = decode_png(ICON_PNG).map(|(rgba, w, h)| {
             let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
             ctx.load_texture("logo", img, egui::TextureOptions::LINEAR)
@@ -205,7 +244,8 @@ impl Gui {
             awdl_active: awdl::active(),
             awdl_checked: Instant::now(),
             awdl_job: None,
-            host: HostRunner::new(),
+            host,
+            host_want,
             job: None,
             sessions: Vec::new(),
             message: None,
@@ -215,10 +255,10 @@ impl Gui {
                 .map(|p| (p, Instant::now())),
             tray,
             tray_rx,
-            hidden: false,
-            quitting: false,
-            start_hidden: background,
+            hidden: background,
+            parked: cfg!(windows) && background,
             frames: 0,
+            quitting: false,
             autostart: crate::autostart::enabled(),
         }
     }
@@ -232,6 +272,13 @@ impl Gui {
 
     fn show_window(&mut self, ctx: &egui::Context) {
         self.hidden = false;
+        if std::mem::take(&mut self.parked) {
+            // 从屏幕外挪回主显示器中间
+            let (monitor, size) = ctx.input(|i| (i.viewport().monitor_size, i.viewport().outer_rect.map(|r| r.size())));
+            if let (Some(m), Some(sz)) = (monitor, size) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(((m - sz) / 2.0).to_pos2()));
+            }
+        }
         crate::tray::set_dock_visible(true);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -240,9 +287,13 @@ impl Gui {
 
     fn set_host_enabled(&mut self, on: bool) {
         self.settings.host = on;
+        self.host_want.store(on, Ordering::SeqCst);
         let _ = config::save_settings(&self.settings);
-        self.host.error = None;
-        self.host.next_try = Instant::now();
+        {
+            let mut h = self.host.lock().unwrap();
+            h.error = None;
+            h.next_try = Instant::now();
+        }
         if let Some(t) = &self.tray {
             t.set_host(on);
         }
@@ -250,19 +301,15 @@ impl Gui {
 
     /// 托盘菜单命令、关闭按钮、后台启动。
     fn window_lifecycle(&mut self, ctx: &egui::Context) {
-        self.frames += 1;
-        if self.start_hidden && self.frames >= 2 && self.tray.is_some() {
-            // eframe 会在第一帧画完后显示窗口，所以第二帧再隐藏
-            self.start_hidden = false;
-            self.hide_window(ctx);
+        self.frames = self.frames.saturating_add(1);
+        if self.parked && self.frames == 2 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
         while let Ok(cmd) = self.tray_rx.try_recv() {
             match cmd {
                 crate::tray::TrayCmd::Show => self.show_window(ctx),
-                crate::tray::TrayCmd::ToggleHost => {
-                    let on = self.tray.as_ref().map(|t| t.host_checked()).unwrap_or(!self.settings.host);
-                    self.set_host_enabled(on);
-                }
+                // 托盘回调里已经切换并保存过了，这里只同步界面里的设置
+                crate::tray::TrayCmd::ToggleHost => self.settings.host = self.host_want.load(Ordering::SeqCst),
                 crate::tray::TrayCmd::Quit => {
                     self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -328,7 +375,7 @@ impl Gui {
                 }
             }
             let mut s = match spawn_viewer(&name, addr, &settings, os.as_deref()) {
-                Ok(s) => s,
+                Ok(s) => Session { host_id, ..s },
                 Err(e) => {
                     return set(Job::Failed {
                         name,
@@ -441,8 +488,15 @@ impl Gui {
         {
             self.message = None;
         }
-        self.host.tick(self.settings.host);
     }
+}
+
+/// 后台线程：每 300 毫秒让被控端的运行状态跟开关一致（不依赖界面刷新）。
+fn spawn_host_keeper(host: Arc<Mutex<HostRunner>>, want: Arc<AtomicBool>) {
+    std::thread::spawn(move || loop {
+        host.lock().unwrap().tick(want.load(Ordering::SeqCst));
+        std::thread::sleep(Duration::from_millis(300));
+    });
 }
 
 /// 被控端：界面打开期间运行，界面关闭后停止。两台电脑都打开本程序才能互相控制。
@@ -660,11 +714,12 @@ impl Gui {
 
     /// 被控端状态：(文字, 圆点颜色)
     fn host_status(&self) -> (&'static str, Color32) {
+        let h = self.host.lock().unwrap();
         if !self.settings.host {
             ("不允许被控制", kit::GRAY)
-        } else if self.host.running() {
+        } else if h.running() {
             ("可被控制", kit::GREEN)
-        } else if self.host.error.is_some() || !self.host.installed() {
+        } else if h.error.is_some() || !h.installed() {
             ("被控端未就绪", kit::ORANGE)
         } else {
             ("正在启动…", kit::GRAY)
@@ -864,6 +919,14 @@ impl Gui {
         }
     }
 
+    /// 是否已经有画面窗口在控制这台设备：有设备 ID 时按 ID 比较，否则按 IP。
+    fn is_connected(&self, id: Option<DeviceId>, addr: SocketAddr) -> bool {
+        self.sessions.iter().any(|s| match (s.host_id, id) {
+            (Some(a), Some(b)) => a == b,
+            _ => s.addr.ip() == addr.ip(),
+        })
+    }
+
     /// 在线设备 + 配对过但当前不在线的设备。
     fn device_cards(&self) -> Vec<CardInfo> {
         let now = Instant::now();
@@ -886,7 +949,7 @@ impl Gui {
                 compatible: d.version == proto::PROTOCOL_VERSION,
                 target: Some((Some(d.host_id), d.addr, Some(d.os.clone()))),
                 forget_id: d.paired.then(|| proto::hex(&d.host_id)),
-                connected: self.sessions.iter().any(|s| s.name == d.name),
+                connected: self.is_connected(Some(d.host_id), d.addr),
             })
             .collect();
         for k in config::known_hosts() {
@@ -895,6 +958,7 @@ impl Gui {
             }
             let addr = k.last_addr.clone().unwrap_or_default();
             let parsed = addr.parse::<SocketAddr>().ok();
+            let id = proto::parse_hex16(&k.id);
             cards.push(CardInfo {
                 name: k.name.clone(),
                 os: String::new(),
@@ -904,7 +968,7 @@ impl Gui {
                 compatible: true,
                 target: parsed.map(|a| (proto::parse_hex16(&k.id), a, None)),
                 forget_id: Some(k.id.clone()),
-                connected: self.sessions.iter().any(|s| s.name == k.name),
+                connected: parsed.is_some_and(|a| self.is_connected(id, a)),
             });
         }
         cards
@@ -1029,7 +1093,7 @@ impl Gui {
                 kit::chip(ui, text, dot);
             });
             self.host_platform_ui(ui);
-            if let Some(e) = &self.host.error {
+            if let Some(e) = self.host.lock().unwrap().error.clone() {
                 ui.add_space(4.0);
                 ui.label(RichText::new(e).size(12.0).color(kit::ORANGE));
             }
@@ -1086,7 +1150,8 @@ impl Gui {
     fn host_platform_ui(&mut self, ui: &mut egui::Ui) {
         use crate::winhost;
         kit::divider(ui);
-        let installed = self.host.state.is_some();
+        let state = self.host.lock().unwrap().state;
+        let installed = state.is_some();
         let desc = if installed {
             "已安装，可以控制锁屏、登录界面和 UAC 弹窗"
         } else {
@@ -1101,7 +1166,7 @@ impl Gui {
                 if kit::secondary_button(ui, "重新安装").clicked() {
                     result = winhost::run_elevated("install");
                 }
-                kit::chip(ui, winhost::state_text(self.host.state), kit::GRAY);
+                kit::chip(ui, winhost::state_text(state), kit::GRAY);
             } else if kit::primary_button(ui, "安装", true).clicked() {
                 result = winhost::run_elevated("install");
             }
@@ -1116,7 +1181,7 @@ impl Gui {
         if !self.settings.host {
             return;
         }
-        let (screen, access) = self.host.perms;
+        let (screen, access) = self.host.lock().unwrap().perms;
         let rows = [
             ("辅助功能", "用来接收对方发来的键盘和鼠标操作", access, "Privacy_Accessibility"),
             ("录屏与系统录音", "用来把这台 Mac 的画面和声音传给对方", screen, "Privacy_ScreenCapture"),
@@ -1361,7 +1426,8 @@ fn device_card(ui: &mut egui::Ui, c: &CardInfo, width: f32, busy: bool) -> (bool
 
 impl eframe::App for Gui {
     fn on_exit(&mut self) {
-        self.host.stop();
+        self.host_want.store(false, Ordering::SeqCst);
+        self.host.lock().unwrap().stop();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1511,6 +1577,8 @@ fn spawn_viewer(
     }
     Ok(Session {
         name: name.to_string(),
+        host_id: None,
+        addr,
         child,
         stderr,
         ready,

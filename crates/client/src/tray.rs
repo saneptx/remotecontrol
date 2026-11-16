@@ -24,7 +24,14 @@ pub struct Tray {
 
 impl Tray {
     /// `rgba` 为 256×256 的应用图标。
-    pub fn new(rgba: &[u8], host_on: bool, ctx: egui::Context, tx: Sender<TrayCmd>) -> Result<Self> {
+    /// `on_toggle`：“允许其他设备控制”被点时在主线程上直接调用（窗口隐藏时界面不刷新，不能等界面处理）。
+    pub fn new(
+        rgba: &[u8],
+        host_on: bool,
+        ctx: egui::Context,
+        tx: Sender<TrayCmd>,
+        on_toggle: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self> {
         let show = MenuItem::new("打开 SuperControl", true, None);
         let host = CheckMenuItem::new("允许其他设备控制", true, host_on, None);
         let quit = MenuItem::new("退出 SuperControl", true, None);
@@ -50,7 +57,7 @@ impl Tray {
                     // 本机被控端随之退出：macOS 上它以 --exit-with-parent 运行；
                     // Windows 上界面互斥量随进程释放，服务会自己停止。
                     TrayCmd::Quit => std::process::exit(0),
-                    TrayCmd::ToggleHost => {}
+                    TrayCmd::ToggleHost => on_toggle(),
                 }
                 let _ = tx.send(cmd);
                 ctx.request_repaint();
@@ -76,10 +83,6 @@ impl Tray {
         #[cfg(not(target_os = "macos"))]
         let builder = builder.with_icon(Icon::from_rgba(resample(rgba, 256, 0, 0, 256, 32), 32, 32)?).with_menu_on_left_click(false);
         Ok(Self { _icon: builder.build()?, host })
-    }
-
-    pub fn host_checked(&self) -> bool {
-        self.host.is_checked()
     }
 
     pub fn set_host(&self, on: bool) {
@@ -171,7 +174,7 @@ pub fn set_dock_visible(_visible: bool) {}
 /// 所以光发 `ViewportCommand::Visible(true)` 不会被处理。托盘回调在主线程上，
 /// 这里先把窗口真正显示出来，界面恢复刷新后再由 `TrayCmd::Show` 同步状态。
 #[cfg(target_os = "macos")]
-fn native_show() {
+pub fn native_show() {
     use objc2::msg_send;
     use objc2::runtime::{AnyClass, AnyObject, Bool};
     set_dock_visible(true);
@@ -194,7 +197,7 @@ fn native_show() {
 }
 
 #[cfg(windows)]
-fn native_show() {
+pub fn native_show() {
     use windows::core::BOOL;
     use windows::Win32::Foundation::{HWND, LPARAM};
     use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -221,4 +224,4 @@ fn native_show() {
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
-fn native_show() {}
+pub fn native_show() {}
