@@ -44,8 +44,13 @@ impl Tray {
                 } else {
                     return;
                 };
-                if matches!(cmd, TrayCmd::Show) {
-                    native_show();
+                match cmd {
+                    TrayCmd::Show => native_show(),
+                    // 窗口隐藏时界面不刷新，等它处理 Close 会一直等下去，所以这里直接退出进程。
+                    // 本机被控端随之退出：macOS 上它以 --exit-with-parent 运行；
+                    // Windows 上界面互斥量随进程释放，服务会自己停止。
+                    TrayCmd::Quit => std::process::exit(0),
+                    TrayCmd::ToggleHost => {}
                 }
                 let _ = tx.send(cmd);
                 ctx.request_repaint();
