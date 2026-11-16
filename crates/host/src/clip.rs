@@ -87,9 +87,19 @@ pub fn run(stream: TcpStream) {
         move |m: &DataMsg| data::write(&mut *w.lock().unwrap(), m)
     };
 
+    // 收到的文件放进剪贴板后，剪贴板监视会把它当成“本机复制了文件”报回去：记下来，跳过这一次
+    let placed: Arc<Mutex<Vec<PathBuf>>> = Arc::default();
     let clip: Arc<dyn ClipboardBackend> = Arc::from(backend(Box::new({
         let send = send.clone();
+        let placed = placed.clone();
         move |ev| {
+            if let ClipEvent::Files(paths) = &ev {
+                let mut p = placed.lock().unwrap();
+                if !p.is_empty() && *p == *paths {
+                    p.clear();
+                    return;
+                }
+            }
             let msg = match ev {
                 ClipEvent::Data(d) => {
                     println!("本机剪贴板变化：{}", describe(&d));
@@ -143,9 +153,13 @@ pub fn run(stream: TcpStream) {
                     Some(Event::Started { files, total_bytes, .. }) => {
                         println!("开始接收 {files} 个文件（{:.1} MB）", total_bytes as f64 / 1e6)
                     }
-                    Some(Event::Done { items, .. }) => {
+                    Some(Event::Done { transfer, items }) => {
                         println!("已接收到“下载”：{}", items.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("、"));
+                        *placed.lock().unwrap() = items.clone();
                         clip.set_files(items);
+                        // 剪贴板在自己的线程里写入：读一次，确认上面的写入已经完成，再告诉对方
+                        let _ = clip.files();
+                        let _ = send(&DataMsg::TransferSaved { transfer });
                     }
                     Some(Event::Failed { reason, .. }) => eprintln!("接收文件失败: {reason}"),
                     _ => {}

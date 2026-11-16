@@ -176,6 +176,8 @@ mod app {
         Displays(Vec<rc_protocol::DisplayInfo>, u32),
         /// 切换到第几块显示器（来自主界面，经标准输入）
         SelectDisplay(u32),
+        /// 测试用：等同于在窗口里按粘贴键（本机复制了文件时发送并在远端粘贴）
+        Paste,
     }
 
     /// 切换显示器的快捷键说明（显示用）。
@@ -276,6 +278,8 @@ mod app {
                 for line in std::io::stdin().lock().lines().map_while(|l| l.ok()) {
                     if let Some(i) = line.strip_prefix("display ").and_then(|v| v.trim().parse().ok()) {
                         let _ = proxy.send_event(UserEvent::SelectDisplay(i));
+                    } else if line.trim() == "paste" {
+                        let _ = proxy.send_event(UserEvent::Paste);
                     }
                 }
             });
@@ -380,6 +384,10 @@ mod app {
                         let more = if names.len() > 1 { format!(" 等 {} 项", names.len()) } else { String::new() };
                         line = format!("远端复制了「{first}」{more}（{:.1} MB），按 {FETCH_KEY} 保存到本机 · {line}", *bytes as f64 / 1e6);
                     }
+                    if let Some((first, n)) = link.local_files_hint() {
+                        let more = if n > 1 { format!(" 等 {n} 项") } else { String::new() };
+                        line = format!("本机复制了「{first}」{more}，在远端粘贴即可发送 · {line}");
+                    }
                     if let Some(st) = link.status.lock().unwrap().as_ref() {
                         line = format!("{st} · {line}");
                     }
@@ -425,6 +433,36 @@ mod app {
             if let Some(c) = &self.control {
                 c.send(&ClientMsg::SelectDisplay { index });
             }
+        }
+
+        /// 把本机复制的文件传到远端，传完后在远端按一次粘贴（用户当前按住的修饰键 + V）。
+        fn paste_files(&self, files: Vec<std::path::PathBuf>) {
+            let (Some(link), Some(control)) = (self.data.clone(), self.control.clone()) else { return };
+            // 远端已按下的修饰键（例如 ⌘ 映射成的 Ctrl），粘贴时一并按下；
+            // 没有按住任何键时（测试命令）按本机 Ctrl 键的映射来
+            let mut mods: Vec<(u16, bool)> = self.keys_down.iter().copied().collect();
+            if mods.is_empty() {
+                mods.extend(keymap::to_scancode(winit::keyboard::KeyCode::ControlLeft, self.args.cmd_as_ctrl));
+            }
+            std::thread::spawn(move || {
+                let Some(id) = link.send_paths(files) else { return };
+                if !link.wait_saved(id, std::time::Duration::from_secs(30)) {
+                    eprintln!("远端没有确认收到文件，未自动粘贴");
+                    return; // 对方没确认（旧版本或出错）：不自动粘贴，用户可以手动再按一次
+                }
+                eprintln!("文件已存到远端，正在远端粘贴");
+                let key = |scancode: u16, extended: bool, down: bool| {
+                    control.send(&ClientMsg::Input(InputEvent::Key { scancode, extended, down }));
+                };
+                for &(s, e) in &mods {
+                    key(s, e, true);
+                }
+                key(0x2f, false, true); // V
+                key(0x2f, false, false);
+                for &(s, e) in mods.iter().rev() {
+                    key(s, e, false);
+                }
+            });
         }
 
         fn send(&self, ev: InputEvent) {
@@ -516,6 +554,11 @@ mod app {
                     self.current_display = current;
                 }
                 UserEvent::SelectDisplay(index) => self.select_display(index),
+                UserEvent::Paste => {
+                    if let Some(files) = self.data.as_ref().and_then(|d| d.take_local_files()) {
+                        self.paste_files(files);
+                    }
+                }
                 UserEvent::Cursor(shape) => {
                     if self.args.stats {
                         println!("光标: {shape:?}");
@@ -608,6 +651,18 @@ mod app {
                             }
                         }
                         return;
+                    }
+                    // 粘贴键（Ctrl+V，Mac 上开启“⌘ 当作 Ctrl”时也包括 ⌘V）：本机刚复制了文件时，
+                    // 先把文件传到远端（存进“下载”并放进远端剪贴板），传完再在远端按下粘贴
+                    let paste_mods = (self.mods.control_key() || (cfg!(target_os = "macos") && self.args.cmd_as_ctrl && self.mods.super_key()))
+                        && !self.mods.shift_key()
+                        && !self.mods.alt_key();
+                    if code == winit::keyboard::KeyCode::KeyV && paste_mods && event.state == ElementState::Pressed && !event.repeat {
+                        if let Some(files) = self.data.as_ref().and_then(|d| d.take_local_files()) {
+                            self.swallowed.insert(code);
+                            self.paste_files(files);
+                            return;
+                        }
                     }
                     // ⌃⌥← / ⌃⌥→（Windows 上 Ctrl+Alt+← / →）：切换远端的显示器
                     use winit::keyboard::KeyCode::{ArrowLeft, ArrowRight};

@@ -45,6 +45,8 @@ pub enum DataMsg {
     TransferEnd { transfer: u32 },
     /// 发送或接收出错，整批作废。
     TransferError { transfer: u32, reason: String },
+    /// 接收方已把这批文件存好并放进了剪贴板（发送方据此在对方那边按粘贴）。
+    TransferSaved { transfer: u32 },
 }
 
 pub fn write(w: &mut impl Write, msg: &DataMsg) -> io::Result<()> {

@@ -1,7 +1,13 @@
 //! 本机剪贴板（控制端）：变化时回调，远端内容写入。
+//!
+//! 本机复制的文件不主动发送（可能很大），只记下来；在远程窗口里按粘贴键时再传过去，见 [`LocalClipboard::take_files`]。
 
 use rc_protocol::data::ClipData;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+/// 本机最近一次复制的文件（之后又复制了别的内容、或写入了远端内容则清空）。
+type PendingFiles = Arc<Mutex<Option<Vec<PathBuf>>>>;
 
 #[cfg(target_os = "macos")]
 pub use mac::LocalClipboard;
@@ -20,13 +26,15 @@ mod mac {
         /// 本程序最近一次写入后的变化计数：本地变化与它相同就不回传
         ours: Arc<AtomicIsize>,
         alive: Arc<AtomicBool>,
+        files: PendingFiles,
     }
 
     impl LocalClipboard {
         pub fn spawn(on_change: Box<dyn Fn(ClipData) + Send>) -> Self {
             let ours = Arc::new(AtomicIsize::new(pasteboard::change_count()));
             let alive = Arc::new(AtomicBool::new(true));
-            let (o, a) = (ours.clone(), alive.clone());
+            let files: PendingFiles = Arc::default();
+            let (o, a, f) = (ours.clone(), alive.clone(), files.clone());
             std::thread::spawn(move || {
                 let mut last = pasteboard::change_count();
                 while a.load(Ordering::Relaxed) {
@@ -39,22 +47,39 @@ mod mac {
                     if now == o.load(Ordering::Relaxed) {
                         continue;
                     }
+                    // 访达复制文件时剪贴板里还有文件名文字和图标图片，不能当普通内容同步
+                    let copied = pasteboard::read_files();
+                    if !copied.is_empty() {
+                        *f.lock().unwrap() = Some(copied);
+                        continue;
+                    }
+                    *f.lock().unwrap() = None;
                     if let Some(d) = pasteboard::read() {
                         on_change(d);
                     }
                 }
             });
-            Self { ours, alive }
+            Self { ours, alive, files }
         }
 
         pub fn set(&self, d: &ClipData) {
             pasteboard::write(d);
             self.ours.store(pasteboard::change_count(), Ordering::Relaxed);
+            *self.files.lock().unwrap() = None;
         }
 
         pub fn set_files(&self, paths: &[PathBuf]) {
             pasteboard::write_files(paths);
             self.ours.store(pasteboard::change_count(), Ordering::Relaxed);
+            *self.files.lock().unwrap() = None;
+        }
+
+        pub fn take_files(&self) -> Option<Vec<PathBuf>> {
+            self.files.lock().unwrap().take()
+        }
+
+        pub fn pending_files(&self) -> Option<Vec<PathBuf>> {
+            self.files.lock().unwrap().clone()
         }
     }
 
@@ -75,24 +100,40 @@ mod win {
     use rc_protocol::data::ClipEvent;
     use rc_windows::clipboard::Clipboard;
 
-    pub struct LocalClipboard(Clipboard);
+    pub struct LocalClipboard(Clipboard, PendingFiles);
 
     impl LocalClipboard {
         pub fn spawn(on_change: Box<dyn Fn(ClipData) + Send>) -> Self {
-            Self(Clipboard::spawn(Box::new(move |ev| {
-                // 控制端复制的文件不主动发送（拖进窗口即可发送）
-                if let ClipEvent::Data(d) = ev {
-                    on_change(d)
-                }
-            })))
+            let files: PendingFiles = Arc::default();
+            let f = files.clone();
+            Self(
+                Clipboard::spawn(Box::new(move |ev| match ev {
+                    ClipEvent::Files(p) => *f.lock().unwrap() = Some(p),
+                    ClipEvent::Data(d) => {
+                        *f.lock().unwrap() = None;
+                        on_change(d)
+                    }
+                })),
+                files,
+            )
         }
 
         pub fn set(&self, d: &ClipData) {
             self.0.set(d.clone());
+            *self.1.lock().unwrap() = None;
         }
 
         pub fn set_files(&self, paths: &[PathBuf]) {
             self.0.set_files(paths.to_vec());
+            *self.1.lock().unwrap() = None;
+        }
+
+        pub fn take_files(&self) -> Option<Vec<PathBuf>> {
+            self.1.lock().unwrap().take()
+        }
+
+        pub fn pending_files(&self) -> Option<Vec<PathBuf>> {
+            self.1.lock().unwrap().clone()
         }
     }
 

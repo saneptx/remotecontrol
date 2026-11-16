@@ -6,7 +6,7 @@ use rc_protocol::transfer::{self, Event};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -20,6 +20,8 @@ pub struct DataLink {
     pending_drop: Arc<Mutex<Vec<PathBuf>>>,
     alive: Arc<AtomicBool>,
     local: Arc<Mutex<Option<LocalClipboard>>>,
+    /// 对方确认已存好的传输编号
+    saved: Arc<(Mutex<Vec<u32>>, Condvar)>,
 }
 
 fn size_text(bytes: u64) -> String {
@@ -43,6 +45,7 @@ impl DataLink {
             pending_drop: Default::default(),
             alive: Arc::new(AtomicBool::new(true)),
             local: Default::default(),
+            saved: Default::default(),
         };
         // 本机剪贴板变化时发给对方
         let sender = link.clone();
@@ -79,6 +82,11 @@ impl DataLink {
                         }
                     }
                     DataMsg::FetchClipboardFiles => {} // 被控端不会向控制端要文件
+                    DataMsg::TransferSaved { transfer } => {
+                        let (list, cv) = &*link.saved;
+                        list.lock().unwrap().push(transfer);
+                        cv.notify_all();
+                    }
                     other => match receiver.handle(other) {
                         Some(Event::Started { files, total_bytes, .. }) => {
                             link.set_status(Some(format!("正在接收 {files} 个文件（{}）", size_text(total_bytes))))
@@ -102,6 +110,18 @@ impl DataLink {
             }
             link.alive.store(false, Ordering::Relaxed);
         });
+    }
+
+    /// 本机刚复制、还没发给对方的文件（取走后不再提示）。
+    pub fn take_local_files(&self) -> Option<Vec<PathBuf>> {
+        self.local.lock().unwrap().as_ref().and_then(|l| l.take_files())
+    }
+
+    /// 本机刚复制的文件：(第一个的名称, 共几项)，用于在窗口标题里提示。
+    pub fn local_files_hint(&self) -> Option<(String, usize)> {
+        let files = self.local.lock().unwrap().as_ref()?.pending_files()?;
+        let first = files.first()?.file_name()?.to_string_lossy().to_string();
+        Some((first, files.len()))
     }
 
     /// 请求对方把它剪贴板里的文件发过来。
@@ -132,7 +152,16 @@ impl DataLink {
         });
     }
 
-    pub fn send_paths(&self, paths: Vec<PathBuf>) {
+    /// 等对方确认第 `id` 批文件已存好、放进了它的剪贴板。
+    pub fn wait_saved(&self, id: u32, timeout: Duration) -> bool {
+        let (list, cv) = &*self.saved;
+        let guard = list.lock().unwrap();
+        let (guard, _) = cv.wait_timeout_while(guard, timeout, |l| !l.contains(&id)).unwrap();
+        guard.contains(&id)
+    }
+
+    /// 发送文件；成功时返回这批传输的编号。
+    pub fn send_paths(&self, paths: Vec<PathBuf>) -> Option<u32> {
         let id = self.next_transfer.fetch_add(1, Ordering::Relaxed);
         let (files, total, _) = transfer::summarize(&paths);
         self.set_status(Some(format!("正在发送 {files} 个文件（{}）", size_text(total))));
@@ -144,10 +173,11 @@ impl DataLink {
                 self.set_status(Some(format!("正在发送 {pct}%")));
             }
         });
-        self.set_status(Some(match result {
+        self.set_status(Some(match &result {
             Ok(()) => format!("已发送 {files} 个文件到远端“下载”（在远端 Ctrl+V 可粘贴到任意文件夹）"),
             Err(e) => format!("发送失败：{e}"),
         }));
+        result.ok().map(|()| id)
     }
 
     pub fn close(&self) {
