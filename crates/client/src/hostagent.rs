@@ -53,9 +53,20 @@ pub fn spawn() -> Result<Child> {
         .context("启动被控端失败")
 }
 
-/// 被控端日志的最后几行（界面里显示权限提示等）。
-pub fn log_tail(n: usize) -> Vec<String> {
-    let text = std::fs::read_to_string(log_path()).unwrap_or_default();
-    let lines: Vec<String> = text.lines().map(str::to_string).collect();
-    lines[lines.len().saturating_sub(n)..].to_vec()
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXIsProcessTrusted() -> bool;
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGPreflightScreenCaptureAccess() -> bool;
+}
+
+/// 系统权限：(录屏与系统录音, 辅助功能)。
+///
+/// 被控端是本程序启动的子进程，macOS 把它的权限算在本应用（SuperControl）上，所以在界面进程里查询的结果
+/// 与被控端一致。辅助功能的授权立即生效；录屏的查询结果在进程启动后可能不再更新。
+pub fn permissions() -> (bool, bool) {
+    unsafe { (CGPreflightScreenCaptureAccess(), AXIsProcessTrusted()) }
 }

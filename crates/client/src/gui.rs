@@ -362,6 +362,11 @@ struct HostRunner {
     next_try: Instant,
     #[cfg(target_os = "macos")]
     child: Option<Child>,
+    /// 系统权限（录屏, 辅助功能），每 2 秒刷新
+    #[cfg(target_os = "macos")]
+    perms: (bool, bool),
+    #[cfg(target_os = "macos")]
+    perms_checked: Instant,
     #[cfg(windows)]
     state: Option<u32>,
     #[cfg(windows)]
@@ -379,6 +384,10 @@ impl HostRunner {
             next_try: Instant::now(),
             #[cfg(target_os = "macos")]
             child: None,
+            #[cfg(target_os = "macos")]
+            perms: crate::hostagent::permissions(),
+            #[cfg(target_os = "macos")]
+            perms_checked: Instant::now(),
             #[cfg(windows)]
             state: crate::winhost::service_state(),
             #[cfg(windows)]
@@ -394,6 +403,17 @@ impl HostRunner {
     /// 让被控端的运行状态跟开关一致。
     #[cfg(target_os = "macos")]
     fn tick(&mut self, want: bool) {
+        // 用户刚授予了权限：重启被控端让它生效，不用重新打开本程序
+        if self.perms_checked.elapsed() > Duration::from_secs(2) {
+            self.perms_checked = Instant::now();
+            let now = crate::hostagent::permissions();
+            let granted = (now.0 && !self.perms.0) || (now.1 && !self.perms.1);
+            self.perms = now;
+            if granted && self.child.is_some() {
+                self.stop();
+                self.next_try = Instant::now();
+            }
+        }
         if let Some(c) = &mut self.child {
             if !matches!(c.try_wait(), Ok(None)) {
                 self.child = None;
@@ -954,33 +974,39 @@ impl Gui {
 
     #[cfg(target_os = "macos")]
     fn host_platform_ui(&mut self, ui: &mut egui::Ui) {
-        use crate::hostagent;
         if !self.settings.host {
             return;
         }
-        kit::divider(ui);
-        kit::setting_row(
-            ui,
-            "系统权限",
-            "需要允许 SuperControl 使用「录屏与系统录音」和「辅助功能」，授权后重新打开本程序",
-            220.0,
-            |ui| {
-                if kit::secondary_button(ui, "辅助功能").clicked() {
-                    let _ = Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility").spawn();
+        let (screen, access) = self.host.perms;
+        let rows = [
+            ("辅助功能", "用来接收对方发来的键盘和鼠标操作", access, "Privacy_Accessibility"),
+            ("录屏与系统录音", "用来把这台 Mac 的画面和声音传给对方", screen, "Privacy_ScreenCapture"),
+        ];
+        for (title, desc, granted, pane) in rows {
+            kit::divider(ui);
+            kit::setting_row(ui, title, desc, 220.0, |ui| {
+                if !granted && kit::secondary_button(ui, "打开设置").clicked() {
+                    let _ = Command::new("open")
+                        .arg(format!("x-apple.systempreferences:com.apple.preference.security?{pane}"))
+                        .spawn();
                 }
-                if kit::secondary_button(ui, "录屏").clicked() {
-                    let _ = Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture").spawn();
+                if granted {
+                    kit::chip(ui, "已允许", kit::GREEN);
+                } else {
+                    kit::chip(ui, "未允许", kit::ORANGE);
                 }
-            },
-        );
-        // 被控端日志里最近的权限 / 错误提示
-        if let Some(line) = hostagent::log_tail(30)
-            .into_iter()
-            .rev()
-            .find(|l| l.contains("权限") || l.contains("失败"))
-        {
+            });
+        }
+        if !(screen && access) {
             ui.add_space(4.0);
-            ui.label(RichText::new(line).size(12.0).color(kit::ORANGE));
+            ui.label(
+                RichText::new(
+                    "在系统设置里打开 SuperControl 的开关，这里会自动更新。如果开关已经打开仍显示“未允许”，\
+                     说明那是旧版本留下的授权：选中 SuperControl 点“−”删除，再重新打开本程序授权。",
+                )
+                .size(12.0)
+                .color(kit::TEXT_WEAK),
+            );
         }
     }
 
