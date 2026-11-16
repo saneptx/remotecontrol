@@ -285,6 +285,7 @@ pub fn spawn_control_reader(
     shared: Arc<Shared>,
     on_cursor: impl Fn(proto::CursorShape) + Send + 'static,
     on_displays: impl Fn(Vec<proto::DisplayInfo>, u32) + Send + 'static,
+    on_mic_port: impl Fn(u16) + Send + 'static,
     on_closed: impl FnOnce() + Send + 'static,
 ) {
     std::thread::spawn(move || {
@@ -294,6 +295,8 @@ pub fn spawn_control_reader(
                 on_cursor(shape);
             } else if let HostMsg::Displays { list, current } = msg {
                 on_displays(list, current);
+            } else if let HostMsg::MicPort { port } = msg {
+                on_mic_port(port);
             } else if let HostMsg::Notice { text } = msg {
                 match &text {
                     Some(t) => eprintln!("被控端: {t}"),

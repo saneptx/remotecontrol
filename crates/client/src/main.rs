@@ -179,6 +179,8 @@ mod app {
         Cursor(rc_protocol::CursorShape),
         /// 被控端的显示器列表与当前显示器
         Displays(Vec<rc_protocol::DisplayInfo>, u32),
+        /// 被控端刚装好虚拟声卡，可以开始传麦克风了
+        MicPort(u16),
         /// 切换到第几块显示器（来自主界面，经标准输入）
         SelectDisplay(u32),
         /// 测试用：等同于在窗口里按粘贴键（本机复制了文件时发送并在远端粘贴）
@@ -228,6 +230,8 @@ mod app {
         audio: Option<rc_audio::Stream>,
         /// 正在发给对方的麦克风
         mic: Option<rc_audio::Stream>,
+        /// 被控端地址（会话中途开始传麦克风时用）
+        addr: Option<std::net::SocketAddr>,
         mods: winit::keyboard::ModifiersState,
         /// 被本地快捷键吃掉的按键：抬起时也不发给远端
         swallowed: HashSet<winit::keyboard::KeyCode>,
@@ -274,6 +278,7 @@ mod app {
             data: None,
             audio: None,
             mic: None,
+            addr: None,
             mods: Default::default(),
             swallowed: HashSet::new(),
             displays: Vec::new(),
@@ -322,6 +327,7 @@ mod app {
                     Err(e) => eprintln!("声音不可用: {e:#}"),
                 }
             }
+            self.addr = Some(conn.addr);
             if self.args.mic {
                 self.start_mic(conn.addr, conn.mic_port);
             }
@@ -352,7 +358,7 @@ mod app {
                 }
                 Err(e) => eprintln!("数据通道不可用（剪贴板与文件传输不可用）: {e:#}"),
             }
-            let (proxy, cursor_proxy, displays_proxy) = (self.proxy.clone(), self.proxy.clone(), self.proxy.clone());
+            let (proxy, cursor_proxy, displays_proxy, mic_proxy) = (self.proxy.clone(), self.proxy.clone(), self.proxy.clone(), self.proxy.clone());
             net::spawn_control_reader(
                 conn.tcp,
                 self.shared.clone(),
@@ -361,6 +367,9 @@ mod app {
                 },
                 move |list, current| {
                     let _ = displays_proxy.send_event(UserEvent::Displays(list, current));
+                },
+                move |port| {
+                    let _ = mic_proxy.send_event(UserEvent::MicPort(port));
                 },
                 move || {
                     let _ = proxy.send_event(UserEvent::Disconnected);
@@ -434,7 +443,7 @@ mod app {
                 *self.shared.audio_note.lock().unwrap() = Some(s.to_string());
             };
             if port == 0 {
-                return note("麦克风未传送：对方没有装虚拟声卡（Windows 装 VB-CABLE，Mac 装 BlackHole）");
+                return note("麦克风暂未传送：对方电脑没有虚拟声卡，已在对方电脑上询问是否安装");
             }
             let started = std::net::UdpSocket::bind("0.0.0.0:0")
                 .and_then(|s| s.connect((addr.ip(), port)).map(|()| s))
@@ -576,6 +585,14 @@ mod app {
                 UserEvent::Disconnected => {
                     eprintln!("连接已断开");
                     event_loop.exit();
+                }
+                UserEvent::MicPort(port) => {
+                    if self.args.mic && self.mic.is_none() {
+                        *self.shared.audio_note.lock().unwrap() = None;
+                        if let Some(addr) = self.addr {
+                            self.start_mic(addr, port);
+                        }
+                    }
                 }
                 UserEvent::Displays(list, current) => {
                     if let Some(d) = list.get(current as usize) {

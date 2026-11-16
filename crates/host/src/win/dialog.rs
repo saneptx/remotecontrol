@@ -17,6 +17,19 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
 }
 
+/// 是 / 否对话框（默认“否”）；`timeout_ms` 内无人响应视为“否”。
+pub fn ask(title: &str, text: &str, timeout_ms: u32) -> bool {
+    let (text, title) = (wide(text), wide(title));
+    std::thread::spawn(move || unsafe {
+        let Ok(user32) = libloading::Library::new("user32.dll") else { return false };
+        let Ok(f) = user32.get::<MessageBoxTimeoutW>(b"MessageBoxTimeoutW\0") else { return false };
+        let flags = MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_TOPMOST | MB_SETFOREGROUND | MB_SYSTEMMODAL;
+        f(0, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), flags.0, 0, timeout_ms) == IDYES
+    })
+    .join()
+    .unwrap_or(false)
+}
+
 /// 询问是否允许配对；60 秒内无人响应视为拒绝。
 pub fn ask_pairing(client: &str, peer: &str, code: &str) -> bool {
     let text = wide(&format!(

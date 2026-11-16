@@ -212,6 +212,45 @@ fn run_host(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// 询问并安装虚拟声卡；装好后开始把控制端的麦克风放进去，并用 [`HostMsg::MicPort`] 通知控制端。
+/// 播放流由本线程持有，会话结束（`alive` 变 false）时停止。
+fn offer_cable_install(client: &str, alive: &Arc<AtomicBool>, writer: &Arc<Mutex<TcpStream>>) {
+    if !trust::approve_cable_install(client) {
+        println!("本机用户暂不安装虚拟声卡");
+        return;
+    }
+    let notice = |text: Option<String>| {
+        let _ = proto::write_msg(&mut *writer.lock().unwrap(), &HostMsg::Notice { text });
+    };
+    notice(Some(format!("对方电脑正在安装虚拟声卡 {}…", rc_audio::install::NAME)));
+    // Windows 被控端以 SYSTEM 运行，可以直接安装；直接运行的被控端（以及 macOS）需要提权确认
+    let elevated = cfg!(windows) && std::env::var("USERNAME").is_ok_and(|u| u.eq_ignore_ascii_case("SYSTEM") || u.ends_with('$'));
+    let started = rc_audio::install::install(elevated).and_then(|()| {
+        let (dev, name) = rc_audio::virtual_cable().context("没有找到虚拟声卡")?;
+        let sock = UdpSocket::bind("0.0.0.0:0")?;
+        let port = sock.local_addr()?.port();
+        let stream = rc_audio::player::start(sock, alive.clone(), Some(dev))?;
+        println!("虚拟声卡已安装，控制端的麦克风将放进「{name}」");
+        Ok((stream, port))
+    });
+    match started {
+        Ok((stream, port)) => {
+            notice(None);
+            let _ = proto::write_msg(&mut *writer.lock().unwrap(), &HostMsg::MicPort { port });
+            while alive.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            drop(stream);
+        }
+        Err(e) => {
+            eprintln!("安装虚拟声卡失败: {e:#}");
+            notice(Some(format!("对方电脑安装虚拟声卡失败：{e:#}")));
+            std::thread::sleep(Duration::from_secs(10));
+            notice(None);
+        }
+    }
+}
+
 /// 占用“当前控制端”名额；析构时释放。
 struct ActiveSlot(Arc<Mutex<Option<String>>>);
 
@@ -407,6 +446,7 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
     }
     // 会话结束时（本函数返回）恢复扬声器、停止播放麦克风
     let _mute = if mute_host { mute::MuteGuard::engage() } else { None };
+    let want_cable = mic && mic_sock.is_none();
     let _mic = mic_sock.and_then(|(s, dev)| match rc_audio::player::start(s, alive.clone(), Some(dev)) {
         Ok(stream) => Some(stream),
         Err(e) => {
@@ -421,6 +461,11 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
     // 控制端要求切换的显示器：下标 + 1，0 表示没有请求
     let select = Arc::new(AtomicU32::new(0));
     let writer = Arc::new(Mutex::new(tcp.try_clone()?));
+    // 控制端要传麦克风、本机却没有虚拟声卡：问本机用户要不要装，装好后告诉控制端开始传
+    if want_cable {
+        let (alive, writer, name) = (alive.clone(), writer.clone(), device_name.clone());
+        std::thread::spawn(move || offer_cable_install(&name, &alive, &writer));
+    }
     let reader = {
         let (alive, want_key, writer, viewport, select) = (alive.clone(), want_key.clone(), writer.clone(), viewport.clone(), select.clone());
         std::thread::spawn(move || {

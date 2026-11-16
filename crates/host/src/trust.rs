@@ -205,6 +205,32 @@ fn mac_dialog(client: &str, peer: &str, code: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 询问本机用户是否安装虚拟声卡（控制端想把麦克风传过来）。60 秒无人响应视为“以后再说”。
+pub fn approve_cable_install(client: &str) -> bool {
+    let text = format!(
+        "「{client}」想把它的麦克风传到这台电脑，供会议、语音软件当麦克风使用。\n\n\
+         这需要先安装虚拟声卡 {}（免费，从官网下载）。\n{}\n\n现在安装吗？",
+        rc_audio::install::NAME,
+        if cfg!(windows) { "安装过程中 Windows 可能询问是否安装设备软件，请点“安装”。" } else { "安装时需要输入这台 Mac 的管理员密码。" }
+    );
+    #[cfg(windows)]
+    {
+        crate::win::dialog::ask("SuperControl：安装虚拟声卡", &text, 60_000)
+    }
+    #[cfg(not(windows))]
+    {
+        let esc = text.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            "display dialog \"{esc}\" with title \"SuperControl：安装虚拟声卡\" buttons {{\"以后再说\", \"安装\"}} default button \"安装\" giving up after 60"
+        );
+        std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("button returned:安装"))
+            .unwrap_or(false)
+    }
+}
+
 /// 设备名只用于显示：去掉控制字符，限制长度。
 pub fn sanitize_name(name: &str) -> String {
     let s: String = name.chars().filter(|c| !c.is_control()).take(64).collect();

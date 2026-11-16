@@ -22,7 +22,8 @@ const ICON_PNG: &[u8] = include_bytes!("../../../packaging/icon/icon-256.png");
 pub fn run(background: bool) -> Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("SuperControl")
-        .with_inner_size([900.0, 620.0])
+        // 自测截图时可用 RC_GUI_HEIGHT 把窗口拉高，看到整页
+        .with_inner_size([900.0, std::env::var("RC_GUI_HEIGHT").ok().and_then(|h| h.parse().ok()).unwrap_or(620.0)])
         .with_min_inner_size([680.0, 480.0])
         // 开机自启：窗口一开始就是隐藏的（macOS 上 eframe 不会再把它显示出来）
         .with_visible(!background);
@@ -164,6 +165,9 @@ struct Gui {
     awdl_active: bool,
     awdl_checked: Instant,
     awdl_job: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    /// 本机是否装了虚拟声卡（后台检测，None 表示还没检测完）
+    cable: Arc<Mutex<Option<bool>>>,
+    cable_job: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     /// 被控端在后台线程里维护（窗口隐藏时界面不刷新，不能靠界面驱动）
     host: Arc<Mutex<HostRunner>>,
     /// “允许其他设备控制”开关；托盘菜单直接改它，界面每帧同步到 settings.host
@@ -244,6 +248,13 @@ impl Gui {
             awdl_active: awdl::active(),
             awdl_checked: Instant::now(),
             awdl_job: None,
+            cable: {
+                let c: Arc<Mutex<Option<bool>>> = Arc::default();
+                let c2 = c.clone();
+                std::thread::spawn(move || *c2.lock().unwrap() = Some(rc_audio::virtual_cable().is_some()));
+                c
+            },
+            cable_job: None,
             host,
             host_want,
             job: None,
@@ -469,6 +480,18 @@ impl Gui {
                 self.awdl_guard = awdl::enabled();
                 if let Err(e) = r {
                     self.say(format!("设置 AWDL 自动处理失败：{e}"), true);
+                }
+            }
+        }
+        if let Some(rx) = &self.cable_job {
+            if let Ok(r) = rx.try_recv() {
+                self.cable_job = None;
+                match r {
+                    Ok(()) => {
+                        *self.cable.lock().unwrap() = Some(true);
+                        self.say(format!("虚拟声卡 {} 已安装", rc_audio::install::NAME), false);
+                    }
+                    Err(e) => self.say(format!("安装虚拟声卡失败：{e}"), true),
                 }
             }
         }
@@ -1078,7 +1101,7 @@ impl Gui {
             kit::setting_row(
                 ui,
                 "把本机麦克风传给对方",
-                "对方的软件（会议、语音）可以把它当麦克风用。需要对方装虚拟声卡：Windows 装 VB-CABLE，Mac 装 BlackHole",
+                "对方的会议、语音软件可以把它当麦克风用。对方需要虚拟声卡，没有的话连接时会在对方电脑上询问是否一键安装",
                 60.0,
                 |ui| changed |= ui.add(Toggle(&mut self.settings.mic)).changed(),
             );
@@ -1109,6 +1132,7 @@ impl Gui {
                 kit::chip(ui, text, dot);
             });
             self.host_platform_ui(ui);
+            self.cable_row(ui);
             if let Some(e) = self.host.lock().unwrap().error.clone() {
                 ui.add_space(4.0);
                 ui.label(RichText::new(e).size(12.0).color(kit::ORANGE));
@@ -1160,6 +1184,38 @@ impl Gui {
             .size(12.0)
             .color(kit::TEXT_FAINT),
         );
+    }
+
+    /// 虚拟声卡：对方把麦克风传过来时，本机软件从这里当麦克风收到声音。
+    fn cable_row(&mut self, ui: &mut egui::Ui) {
+        kit::divider(ui);
+        let mic_name = if cfg!(windows) { "CABLE Output" } else { "BlackHole 2ch" };
+        let desc = format!(
+            "对方开启“把本机麦克风传给对方”后，这台电脑上的会议、语音软件把麦克风选成“{mic_name}”即可。没装的话，对方连上时也会在这里询问"
+        );
+        let installed = *self.cable.lock().unwrap();
+        let busy = self.cable_job.is_some();
+        kit::setting_row(ui, &format!("虚拟声卡 {}", rc_audio::install::NAME), &desc, 200.0, |ui| {
+            if busy {
+                ui.spinner();
+                kit::chip(ui, "正在安装…", kit::GRAY);
+            } else {
+                match installed {
+                    Some(true) => kit::chip(ui, "已安装", kit::GREEN),
+                    Some(false) => {
+                        if kit::primary_button(ui, "安装", true).clicked() {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            self.cable_job = Some(rx);
+                            std::thread::spawn(move || {
+                                let _ = tx.send(rc_audio::install::install(false).map_err(|e| format!("{e:#}")));
+                            });
+                        }
+                        kit::chip(ui, "未安装", kit::GRAY)
+                    }
+                    None => kit::chip(ui, "检测中…", kit::GRAY),
+                }
+            }
+        });
     }
 
     #[cfg(windows)]

@@ -110,6 +110,8 @@ pub enum HostMsg {
     Cursor { shape: CursorShape },
     /// 被控端的显示器列表和当前显示的那块；连接后发送一次，切换显示器后再发送。
     Displays { list: Vec<DisplayInfo>, current: u32 },
+    /// 会话中途才准备好接收麦克风（刚装好虚拟声卡）：控制端开始往这个 UDP 端口发麦克风声音。
+    MicPort { port: u16 },
 }
 
 /// 视频编码格式。两端都是 Annex-B 码流、4:2:0、无 B 帧、关键帧带参数集。

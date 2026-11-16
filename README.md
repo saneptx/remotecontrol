@@ -98,8 +98,10 @@ SYSTEM 身份可以进入锁屏 / UAC 所在的安全桌面，工作进程在桌
 
 - **播放远端的声音**：默认开启
 - **控制时让对方静音**：默认开启。连接期间对方扬声器静音（声音照样传到本机），断开后恢复；对方原本就静音的保持不变
-- **把本机麦克风传给对方**：默认关闭。对方需要装虚拟声卡——Windows 装 [VB-CABLE](https://vb-audio.com/Cable/)，
-  Mac 装 [BlackHole](https://existential.audio/blackhole/)；然后在对方的会议 / 语音软件里把麦克风选成
+- **把本机麦克风传给对方**：默认关闭。对方需要虚拟声卡（Windows：[VB-CABLE](https://vb-audio.com/Cable/)；
+  Mac：[BlackHole](https://existential.audio/blackhole/)）。没有的话，连接时对方电脑上会弹窗询问，点“安装”即自动从官网下载安装
+  （Windows 可能再确认一次“安装设备软件”，Mac 需要输入管理员密码），装好后无需重连就开始传送；
+  也可以在 设置 → 被控制 →“虚拟声卡”里提前安装。之后在对方的会议 / 语音软件里把麦克风选成
   “CABLE Output” / “BlackHole 2ch”。Mac 第一次开启时会询问是否允许 SuperControl 使用麦克风
 - **Command 键当作 Ctrl**：⌘C / ⌘V 直接对应 Windows 的复制粘贴（默认开启）
 - **按原始分辨率传输**：默认按窗口的实际像素尺寸缩小编码（延迟更低、显示效果相同）

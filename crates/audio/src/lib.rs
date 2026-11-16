@@ -2,6 +2,7 @@
 //! - [`player`]：接收 PCM 包，经抖动缓冲后播放到某个输出设备（控制端放远端声音；被控端把麦克风声音放进虚拟声卡）。
 //! - [`mic`]：采集本机麦克风，打包发给对方。
 
+pub mod install;
 pub mod mic;
 pub mod player;
 
