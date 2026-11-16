@@ -44,6 +44,9 @@ impl Tray {
                 } else {
                     return;
                 };
+                if matches!(cmd, TrayCmd::Show) {
+                    native_show();
+                }
                 let _ = tx.send(cmd);
                 ctx.request_repaint();
             }));
@@ -52,6 +55,7 @@ impl Tray {
         TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
             if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
                 if cfg!(windows) {
+                    native_show();
                     let _ = tx.send(TrayCmd::Show);
                     ctx.request_repaint();
                 }
@@ -155,3 +159,61 @@ pub fn set_dock_visible(visible: bool) {
 
 #[cfg(not(target_os = "macos"))]
 pub fn set_dock_visible(_visible: bool) {}
+
+/// 直接用系统接口把主窗口显示出来。
+///
+/// 窗口隐藏后 eframe 不再调用 `update`（系统不给隐藏的窗口发重绘），
+/// 所以光发 `ViewportCommand::Visible(true)` 不会被处理。托盘回调在主线程上，
+/// 这里先把窗口真正显示出来，界面恢复刷新后再由 `TrayCmd::Show` 同步状态。
+#[cfg(target_os = "macos")]
+fn native_show() {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject, Bool};
+    set_dock_visible(true);
+    unsafe {
+        let Some(cls) = AnyClass::get(c"NSApplication") else { return };
+        let app: *mut AnyObject = msg_send![cls, sharedApplication];
+        let windows: *mut AnyObject = msg_send![app, windows];
+        let n: usize = msg_send![windows, count];
+        for i in 0..n {
+            let w: *mut AnyObject = msg_send![windows, objectAtIndex: i];
+            // 只恢复带标题栏的普通窗口（菜单栏图标本身也是一个 NSWindow）
+            let can_main: Bool = msg_send![w, canBecomeMainWindow];
+            if can_main.as_bool() {
+                let _: () = msg_send![w, deminiaturize: std::ptr::null::<AnyObject>()];
+                let _: () = msg_send![w, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+            }
+        }
+        let _: () = msg_send![app, activateIgnoringOtherApps: Bool::YES];
+    }
+}
+
+#[cfg(windows)]
+fn native_show() {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumThreadWindows, GetWindowTextW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+    };
+    unsafe extern "system" fn each(hwnd: HWND, _: LPARAM) -> BOOL {
+        let mut buf = [0u16; 64];
+        let n = unsafe { GetWindowTextW(hwnd, &mut buf) } as usize;
+        if String::from_utf16_lossy(&buf[..n]) == "SuperControl" {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOW);
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+                let _ = SetForegroundWindow(hwnd);
+            }
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+    // 托盘回调和主窗口在同一个（主）线程上
+    unsafe {
+        let _ = EnumThreadWindows(GetCurrentThreadId(), Some(each), LPARAM(0));
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn native_show() {}
