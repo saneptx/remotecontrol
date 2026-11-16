@@ -35,9 +35,15 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# 本地临时签名：系统权限（本地网络等）才能稳定地记在这个应用上
-codesign --force --sign - --identifier com.remotecontrol.host "$APP/Contents/MacOS/rc-host" >/dev/null
-codesign --force --sign - "$APP" >/dev/null
+# 签名：有本地证书（packaging/macos/create-signing-cert.sh 创建）就用它，否则临时签名。
+# 临时签名每次编译都会变，macOS 会把之前给的“辅助功能”“录屏”授权当作别的程序；固定证书签名则一直有效。
+IDENTITY="SuperControl Local Signing"
+if ! security find-identity -p codesigning | grep -q "\"$IDENTITY\""; then
+    echo "提示：没有找到证书「$IDENTITY」，使用临时签名（每次更新后需要重新授权）。运行 packaging/macos/create-signing-cert.sh 创建" >&2
+    IDENTITY=-
+fi
+codesign --force --sign "$IDENTITY" --identifier com.remotecontrol.host "$APP/Contents/MacOS/rc-host" >/dev/null
+codesign --force --sign "$IDENTITY" "$APP" >/dev/null
 echo "已生成 $APP"
 
 if [ "${1:-}" = "--install" ]; then

@@ -120,8 +120,12 @@ cargo build --release -p rc-host
 控制端（macOS）：
 
 ```
-packaging/macos/make-app.sh            # 生成 target/SuperControl.app
+packaging/macos/create-signing-cert.sh # 第一次：在登录钥匙串里创建本地签名证书（只需一次）
+packaging/macos/make-app.sh            # 生成 target/SuperControl.app（加 --install 装到“应用程序”）
 ```
+
+有本地签名证书时，更新后“辅助功能”“录屏与系统录音”的授权依然有效；没有证书只能临时签名，
+每次重新编译都要在系统设置里删掉旧的 SuperControl 再重新授权。
 
 被控端常用参数：
 
