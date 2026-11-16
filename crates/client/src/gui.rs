@@ -57,7 +57,7 @@ struct Gui {
     awdl_active: bool,
     awdl_checked: Instant,
     awdl_job: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
-    host_enabled: bool,
+    host: HostRunner,
     job: Option<Arc<Mutex<Job>>>,
     sessions: Vec<Session>,
     message: Option<(String, bool)>,
@@ -78,10 +78,7 @@ impl Gui {
             awdl_active: awdl::active(),
             awdl_checked: Instant::now(),
             awdl_job: None,
-            #[cfg(target_os = "macos")]
-            host_enabled: crate::hostagent::enabled(),
-            #[cfg(not(target_os = "macos"))]
-            host_enabled: false,
+            host: HostRunner::new(),
             job: None,
             sessions: Vec::new(),
             message: None,
@@ -174,6 +171,7 @@ impl Gui {
             self.awdl_checked = Instant::now();
             self.awdl_active = awdl::active();
         }
+        self.host.tick(self.settings.host);
     }
 
     fn device_list(&mut self, ui: &mut egui::Ui) {
@@ -297,19 +295,156 @@ impl Gui {
     }
 }
 
-impl Gui {
+/// 被控端：界面打开期间运行，界面关闭后停止。两台电脑都打开本程序才能互相控制。
+struct HostRunner {
+    error: Option<String>,
+    next_try: Instant,
+    #[cfg(target_os = "macos")]
+    child: Option<Child>,
     #[cfg(windows)]
-    fn host_ui(&mut self, ui: &mut egui::Ui) {
+    state: Option<u32>,
+    #[cfg(windows)]
+    checked: Instant,
+}
+
+impl HostRunner {
+    fn new() -> Self {
+        #[cfg(target_os = "macos")]
+        crate::hostagent::remove_legacy_agent();
+        #[cfg(windows)]
+        crate::winhost::hold_ui_mutex();
+        Self {
+            error: None,
+            next_try: Instant::now(),
+            #[cfg(target_os = "macos")]
+            child: None,
+            #[cfg(windows)]
+            state: crate::winhost::service_state(),
+            #[cfg(windows)]
+            checked: Instant::now(),
+        }
+    }
+
+    fn retry_later(&mut self, e: anyhow::Error) {
+        self.error = Some(format!("{e:#}"));
+        self.next_try = Instant::now() + Duration::from_secs(10);
+    }
+
+    /// 让被控端的运行状态跟开关一致。
+    #[cfg(target_os = "macos")]
+    fn tick(&mut self, want: bool) {
+        if let Some(c) = &mut self.child {
+            if !matches!(c.try_wait(), Ok(None)) {
+                self.child = None;
+                self.error = Some("被控端已退出，稍后自动重启（详见日志）".into());
+                self.next_try = Instant::now() + Duration::from_secs(5);
+            }
+        }
+        if want && self.child.is_none() && Instant::now() >= self.next_try {
+            match crate::hostagent::spawn() {
+                Ok(c) => {
+                    self.child = Some(c);
+                    self.error = None;
+                }
+                Err(e) => self.retry_later(e),
+            }
+        }
+        if !want {
+            self.stop();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn running(&self) -> bool {
+        self.child.is_some()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn stop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    #[cfg(windows)]
+    fn tick(&mut self, want: bool) {
         use crate::winhost;
-        let state = winhost::service_state();
+        if self.checked.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.checked = Instant::now();
+        self.state = winhost::service_state();
+        let Some(state) = self.state else { return };
+        let running = matches!(state, 2 | 4);
+        if want != running && state != 3 && Instant::now() >= self.next_try {
+            match winhost::control(want) {
+                Ok(()) => self.error = None,
+                Err(e) => self.retry_later(e),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn running(&self) -> bool {
+        self.state == Some(4)
+    }
+
+    #[cfg(windows)]
+    fn stop(&mut self) {
+        if matches!(self.state, Some(2 | 4)) {
+            let _ = crate::winhost::control(false);
+        }
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn tick(&mut self, _want: bool) {}
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn running(&self) -> bool {
+        false
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn stop(&mut self) {}
+}
+
+impl Gui {
+    fn host_ui(&mut self, ui: &mut egui::Ui) {
+        let mut on = self.settings.host;
         ui.horizontal(|ui| {
-            ui.label("允许其他设备控制这台电脑（系统服务）：");
-            ui.label(RichText::new(state.unwrap_or("未安装")).strong());
+            if ui
+                .checkbox(&mut on, "允许其他设备控制这台电脑")
+                .on_hover_text("只在本程序打开期间可被控制，关闭本程序后停止。其他电脑首次连接时，这里会弹窗请你确认配对码。")
+                .changed()
+            {
+                self.settings.host = on;
+                let _ = config::save_settings(&self.settings);
+                self.host.error = None;
+                self.host.next_try = Instant::now();
+            }
+            if on {
+                let (text, color) = if self.host.running() { ("运行中", Color32::from_rgb(40, 140, 60)) } else { ("未运行", Color32::GRAY) };
+                ui.label(RichText::new(text).small().color(color));
+            }
         });
+        self.host_platform_ui(ui);
+        if let Some(e) = &self.host.error {
+            ui.label(RichText::new(e).small().color(Color32::from_rgb(200, 120, 0)));
+        }
+    }
+
+    #[cfg(windows)]
+    fn host_platform_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::winhost;
         ui.horizontal(|ui| {
-            let (label, args) = if state.is_some() { ("卸载", "uninstall") } else { ("安装并启动", "install") };
-            if ui.button(label).on_hover_text("需要管理员权限（会弹出确认）").clicked() {
+            ui.label(RichText::new(format!("被控端服务：{}", winhost::state_text(self.host.state))).small().weak());
+            let (label, args) = if self.host.state.is_some() { ("重新安装", "install") } else { ("安装", "install") };
+            if ui.small_button(label).on_hover_text("需要管理员权限（会弹出确认），只需安装一次。安装后可以控制锁屏和 UAC 界面").clicked() {
                 if let Err(e) = winhost::run_elevated(args) {
+                    self.message = Some((format!("{e:#}"), true));
+                }
+            }
+            if self.host.state.is_some() && ui.small_button("卸载").clicked() {
+                if let Err(e) = winhost::run_elevated("uninstall") {
                     self.message = Some((format!("{e:#}"), true));
                 }
             }
@@ -317,35 +452,28 @@ impl Gui {
     }
 
     #[cfg(target_os = "macos")]
-    fn host_ui(&mut self, ui: &mut egui::Ui) {
+    fn host_platform_ui(&mut self, ui: &mut egui::Ui) {
         use crate::hostagent;
-        let mut on = self.host_enabled;
-        if ui
-            .checkbox(&mut on, "允许其他设备控制这台 Mac")
-            .on_hover_text("登录后自动在后台运行被控端。其他电脑首次连接时，这里会弹窗请你确认配对码。")
-            .changed()
-        {
-            match hostagent::set_enabled(on) {
-                Ok(()) => self.host_enabled = on,
-                Err(e) => self.message = Some((format!("{e:#}"), true)),
-            }
+        if !self.settings.host {
+            return;
         }
-        if self.host_enabled {
-            ui.label(RichText::new("首次开启需要在系统设置中允许 rc-host 使用以下两项权限，授权后重新开启一次本开关：").small().weak());
-            ui.horizontal(|ui| {
-                if ui.small_button("录屏与系统录音…").clicked() {
-                    let _ = Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture").spawn();
-                }
-                if ui.small_button("辅助功能…").clicked() {
-                    let _ = Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility").spawn();
-                }
-            });
-            // 被控端日志里最近的权限 / 错误提示
-            if let Some(line) = hostagent::log_tail(30).into_iter().rev().find(|l| l.contains("权限") || l.contains("失败")) {
-                ui.label(RichText::new(line).small().color(Color32::from_rgb(200, 120, 0)));
+        ui.label(RichText::new("首次使用需要在系统设置中允许 RemoteControl 使用以下两项权限，授权后重新打开本程序：").small().weak());
+        ui.horizontal(|ui| {
+            if ui.small_button("录屏与系统录音…").clicked() {
+                let _ = Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture").spawn();
             }
+            if ui.small_button("辅助功能…").clicked() {
+                let _ = Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility").spawn();
+            }
+        });
+        // 被控端日志里最近的权限 / 错误提示
+        if let Some(line) = hostagent::log_tail(30).into_iter().rev().find(|l| l.contains("权限") || l.contains("失败")) {
+            ui.label(RichText::new(line).small().color(Color32::from_rgb(200, 120, 0)));
         }
     }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn host_platform_ui(&mut self, _ui: &mut egui::Ui) {}
 }
 
 fn device_row(ui: &mut egui::Ui, name: &str, os: &str, addr: &str, badge: &str, good: bool, buttons: impl FnOnce(&mut egui::Ui)) {
@@ -372,6 +500,10 @@ fn device_row(ui: &mut egui::Ui, name: &str, os: &str, addr: &str, badge: &str, 
 }
 
 impl eframe::App for Gui {
+    fn on_exit(&mut self) {
+        self.host.stop();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
         let ctx = ui.ctx().clone();

@@ -7,6 +7,10 @@
 //! 服务会守护工作进程：进程退出就重启；用户注销、切换用户导致控制台会话变化时，
 //! 结束旧进程并在新会话里重新启动。
 //!
+//! 服务是“手动启动”的：由界面程序（rc-client）打开时启动，界面运行期间持有全局互斥量
+//! `UI_MUTEX`，服务发现它消失（界面关闭或崩溃）就自行停止。安装时允许普通交互用户启动 / 停止本服务，
+//! 所以界面不需要管理员权限。
+//!
 //! 目录：
 //! - 程序：`%ProgramFiles%\RemoteControl\rc-host.exe`
 //! - 数据：`%ProgramData%\RemoteControl\`（密码与日志；仅 SYSTEM 和管理员可读）
@@ -49,6 +53,9 @@ const DISPLAY_NAME: &str = "RemoteControl 被控端";
 const DESCRIPTION: &str = "局域网远程控制被控端：采集屏幕并接受远程键鼠操作，可控制锁屏与 UAC 界面。";
 const FIREWALL_RULE: &str = "RemoteControlHost";
 const NO_SESSION: u32 = u32::MAX;
+/// 服务的访问控制：系统默认值，再给交互用户（IU）加上启动（RP）和停止（WP）权限。
+const SERVICE_SDDL: &str =
+    "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPWPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)";
 
 fn program_dir() -> PathBuf {
     PathBuf::from(std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into())).join("RemoteControl")
@@ -186,15 +193,42 @@ impl Drop for Worker {
     }
 }
 
+/// 界面程序是否在运行（任意会话）。
+fn ui_running() -> bool {
+    use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    let name = windows::core::HSTRING::from(rc_protocol::UI_MUTEX);
+    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &name) } {
+        Ok(h) => {
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 fn supervise(args: &Args, stop: &mpsc::Receiver<()>) {
     let mut worker: Option<Worker> = None;
     let mut failures = 0u32;
     let mut next_start = Instant::now();
+    let started = Instant::now();
+    let mut ui_gone_since: Option<Instant> = None;
 
     loop {
         match stop.recv_timeout(Duration::from_millis(500)) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
+        }
+        // 界面关闭后停止服务（刚启动时给界面留一点时间；短暂消失不算，例如界面重启）
+        if ui_running() {
+            ui_gone_since = None;
+        } else {
+            let since = *ui_gone_since.get_or_insert_with(Instant::now);
+            if started.elapsed() > Duration::from_secs(20) && since.elapsed() > Duration::from_secs(3) {
+                log("RemoteControl 界面程序没有运行，服务自行停止");
+                break;
+            }
         }
         let session = unsafe { WTSGetActiveConsoleSessionId() };
 
@@ -473,14 +507,14 @@ pub fn install(args: &Args) -> Result<()> {
     }
     let public = public_lan_interfaces();
 
-    // 4. 创建（或更新）服务：开机自动启动，以 LocalSystem 运行，崩溃后自动重启。
+    // 4. 创建（或更新）服务：手动启动（由界面程序启动），以 LocalSystem 运行，崩溃后自动重启。
     let mut launch_arguments: Vec<OsString> = vec!["service".into()];
     launch_arguments.extend(worker_args(args).into_iter().map(OsString::from));
     let info = ServiceInfo {
         name: SERVICE_NAME.into(),
         display_name: DISPLAY_NAME.into(),
         service_type: ServiceType::OWN_PROCESS,
-        start_type: ServiceStartType::AutoStart,
+        start_type: ServiceStartType::OnDemand,
         error_control: ServiceErrorControl::Normal,
         executable_path: exe.clone(),
         launch_arguments,
@@ -502,9 +536,14 @@ pub fn install(args: &Args) -> Result<()> {
         command: None,
         actions: Some((0..3).map(|_| ServiceAction { action_type: ServiceActionType::Restart, delay: Duration::from_secs(5) }).collect()),
     })?;
+    // 允许交互登录的普通用户启动 / 停止本服务（RP / WP），界面程序因此不需要管理员权限
+    if !quiet("sc", &["sdset", SERVICE_NAME, SERVICE_SDDL]) {
+        eprintln!("警告：设置服务权限失败，界面程序可能无法启动被控端");
+    }
     service.start(&[] as &[&OsStr]).context("启动服务失败")?;
 
-    println!("已安装并启动系统服务「{DISPLAY_NAME}」，开机自动运行。");
+    println!("已安装系统服务「{DISPLAY_NAME}」。");
+    println!("被控端随 RemoteControl 界面程序一起运行：打开 rc-client.exe 时启动，关闭后自动停止。");
     println!();
     println!("  本机名称：{}", args.name.clone().unwrap_or_else(crate::trust::computer_name));
     println!("  端口：    {}", args.port);

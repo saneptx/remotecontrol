@@ -21,6 +21,8 @@ pub const PROTOCOL_VERSION: u32 = 7;
 pub const DEFAULT_PORT: u16 = 47800;
 /// 局域网发现使用的 UDP 端口。
 pub const DISCOVERY_PORT: u16 = 47801;
+/// Windows：界面程序运行期间持有的全局互斥量。被控端服务发现它消失（界面已关闭）就自行停止。
+pub const UI_MUTEX: &str = "Global\\RemoteControlUI";
 const MAX_MSG_LEN: u32 = 64 * 1024;
 
 /// 设备的持久随机标识（首次运行时生成）。

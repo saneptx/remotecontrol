@@ -34,7 +34,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// 安装为 Windows 系统服务：开机自启，可控制锁屏、登录界面与 UAC 弹窗（需要管理员权限）
+    /// 安装为 Windows 系统服务：随 RemoteControl 界面启动，可控制锁屏、登录界面与 UAC 弹窗（需要管理员权限）
     Install(Args),
     /// 卸载系统服务（需要管理员权限）
     Uninstall,
@@ -75,6 +75,9 @@ pub struct Args {
     /// 测试用：随机丢弃该比例（%）的视频包，模拟网络丢包
     #[arg(long, hide = true, default_value_t = 0.0)]
     pub sim_loss: f64,
+    /// 由界面程序启动：父进程（界面）退出后本进程也退出
+    #[arg(long, hide = true)]
+    pub exit_with_parent: bool,
 }
 
 /// 进程启动以来的微秒数；采集时间戳与 Pong 共用这一时钟。
@@ -146,6 +149,18 @@ pub fn list_devices() -> Result<()> {
 
 fn run_host(args: Args) -> Result<()> {
     now_us();
+    #[cfg(unix)]
+    if args.exit_with_parent {
+        // 界面退出（包括崩溃）后父进程变成 launchd，被控端随之退出
+        let parent = std::os::unix::process::parent_id();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if std::os::unix::process::parent_id() != parent {
+                println!("界面程序已关闭，被控端退出");
+                std::process::exit(0);
+            }
+        });
+    }
     #[cfg(windows)]
     win::power::init(!args.allow_sleep);
     #[cfg(target_os = "macos")]

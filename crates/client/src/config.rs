@@ -28,6 +28,9 @@ pub struct Settings {
     /// 播放远端的声音
     #[serde(default = "yes")]
     pub audio: bool,
+    /// 界面打开期间允许其他设备控制本机
+    #[serde(default = "yes")]
+    pub host: bool,
 }
 
 fn yes() -> bool {
@@ -36,7 +39,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { cmd_as_ctrl: true, native: false, audio: true }
+        Self { cmd_as_ctrl: true, native: false, audio: true, host: true }
     }
 }
 
