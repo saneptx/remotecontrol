@@ -43,8 +43,9 @@ PLIST
 # 签名：有本地证书（packaging/macos/create-signing-cert.sh 创建）就用它，否则临时签名。
 # 临时签名每次编译都会变，macOS 会把之前给的“辅助功能”“录屏”授权当作别的程序；固定证书签名则一直有效。
 IDENTITY="SuperControl Local Signing"
-[ -n "${GITHUB_ACTIONS:-}" ] && echo "::notice::find-identity: $(security find-identity -p codesigning 2>&1 | tr '\n' ' ')"
-if ! security find-identity -p codesigning | grep -q "\"$IDENTITY\""; then
+# 不用 “security … | grep -q” 管道：在 set -o pipefail 下它在 GitHub 的 macOS 机器上会让脚本失败
+IDENTITIES=$(security find-identity -p codesigning 2>/dev/null || true)
+if [[ "$IDENTITIES" != *"\"$IDENTITY\""* ]]; then
     echo "提示：没有找到证书「$IDENTITY」，使用临时签名（每次更新后需要重新授权）。运行 packaging/macos/create-signing-cert.sh 创建" >&2
     IDENTITY=-
 fi
