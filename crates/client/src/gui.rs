@@ -1087,6 +1087,19 @@ impl Gui {
                 changed |= ui.add(Toggle(&mut self.settings.cmd_as_ctrl)).changed()
             });
             kit::divider(ui);
+            let (keys_desc, release) = if cfg!(target_os = "macos") {
+                ("⌘Tab、⌃←/→ 切桌面、⌃↑ 调度中心、⌘空格 等在远程窗口里发给对方，并换成对方系统的对应快捷键", "⌃⌥⌘")
+            } else {
+                ("Alt+Tab、Ctrl+Win+←/→ 切桌面、Win+Tab、Win+D、Win 键 等在远程窗口里发给对方，并换成对方系统的对应快捷键", "Ctrl+Alt+Win")
+            };
+            kit::setting_row(
+                ui,
+                "把系统快捷键发给对方",
+                &format!("{keys_desc}。临时交还本机：同时按住 {release}，点一下远程画面恢复"),
+                60.0,
+                |ui| changed |= ui.add(Toggle(&mut self.settings.system_keys)).changed(),
+            );
+            kit::divider(ui);
             kit::setting_row(
                 ui,
                 "播放远端的声音",
@@ -1613,6 +1626,12 @@ fn spawn_viewer(
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("view").arg(addr.to_string());
     // Mac 控制任何系统时都按习惯互换；Windows 只在控制 Mac 时互换（控制 Windows 时 Ctrl 就是 Ctrl）
+    if let Some(os) = host_os.filter(|o| matches!(*o, "macos" | "windows")) {
+        cmd.arg("--host-os").arg(os);
+    }
+    if !settings.system_keys {
+        cmd.arg("--local-shortcuts");
+    }
     if settings.cmd_as_ctrl && (cfg!(target_os = "macos") || host_os == Some("macos")) {
         cmd.arg("--cmd-as-ctrl");
     }

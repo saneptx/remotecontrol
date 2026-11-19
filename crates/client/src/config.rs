@@ -40,6 +40,9 @@ pub struct Settings {
     /// 把本机麦克风传给对方（对方需要装虚拟声卡）
     #[serde(default)]
     pub mic: bool,
+    /// 远程窗口在前台时，把切应用、切桌面等系统快捷键发给对方
+    #[serde(default = "yes")]
+    pub system_keys: bool,
 }
 
 fn yes() -> bool {
@@ -48,7 +51,7 @@ fn yes() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { cmd_as_ctrl: true, native: false, audio: true, host: true, close_to_tray: true, mute_host: true, mic: false }
+        Self { cmd_as_ctrl: true, native: false, audio: true, host: true, close_to_tray: true, mute_host: true, mic: false, system_keys: true }
     }
 }
 

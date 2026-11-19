@@ -24,6 +24,12 @@ mod awdl {
     pub fn set_enabled(_: bool) -> anyhow::Result<()> {
         Ok(())
     }
+    pub fn guard_installed() -> bool {
+        false
+    }
+    pub fn guard_outdated() -> bool {
+        false
+    }
 }
 #[cfg(any(target_os = "macos", windows))]
 mod config;
@@ -35,6 +41,10 @@ mod autostart;
 mod tray;
 #[cfg(any(target_os = "macos", windows))]
 mod datalink;
+#[cfg(any(target_os = "macos", windows))]
+mod shortcuts;
+#[cfg(any(target_os = "macos", windows))]
+mod syskeys;
 #[cfg(target_os = "macos")]
 #[path = "display_mac.rs"]
 mod display;
@@ -121,6 +131,7 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(any(target_os = "macos", windows))]
 mod app {
+    use crate::shortcuts::{self as sc, Os};
     use crate::{display::VideoSink, keymap, net};
     use anyhow::{Context, Result};
     use rc_protocol::{ClientMsg, InputEvent};
@@ -131,7 +142,7 @@ mod app {
     use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
     use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
     use winit::event_loop::{ActiveEventLoop, EventLoop};
-    use winit::keyboard::PhysicalKey;
+    use winit::keyboard::{KeyCode, PhysicalKey};
     #[cfg(target_os = "macos")]
     use winit::platform::macos::EventLoopBuilderExtMacOS;
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -166,6 +177,12 @@ mod app {
         /// 把本机麦克风传给对方（对方需要装虚拟声卡：VB-CABLE / BlackHole）
         #[arg(long)]
         mic: bool,
+        /// 对方的系统（macos / windows），用于翻译切应用、切桌面等快捷键；默认按与本机不同的系统处理
+        #[arg(long, value_parser = ["macos", "windows"])]
+        host_os: Option<String>,
+        /// 不拦截本机的系统快捷键（⌘Tab / Alt+Tab、切桌面等留给本机）
+        #[arg(long)]
+        local_shortcuts: bool,
         /// 指定视频格式（默认 HEVC 优先，本机或对方不支持时用 H.264）
         #[arg(long, value_parser = ["hevc", "h264"])]
         codec: Option<String>,
@@ -185,6 +202,27 @@ mod app {
         SelectDisplay(u32),
         /// 测试用：等同于在窗口里按粘贴键（本机复制了文件时发送并在远端粘贴）
         Paste,
+        /// 被系统快捷键拦截（Windows 键盘钩子）拦下的按键
+        HookKey(KeyCode, bool),
+    }
+
+    /// 测试命令里的键名。
+    fn test_key(name: &str) -> Option<KeyCode> {
+        use KeyCode::*;
+        Some(match name {
+            "SuperLeft" => SuperLeft,
+            "ControlLeft" => ControlLeft,
+            "AltLeft" => AltLeft,
+            "ShiftLeft" => ShiftLeft,
+            "Tab" => Tab,
+            "ArrowLeft" => ArrowLeft,
+            "ArrowRight" => ArrowRight,
+            "ArrowUp" => ArrowUp,
+            "Space" => Space,
+            "F11" => F11,
+            "KeyD" => KeyD,
+            _ => return None,
+        })
     }
 
     /// 切换显示器的快捷键说明（显示用）。
@@ -232,12 +270,23 @@ mod app {
         mic: Option<rc_audio::Stream>,
         /// 被控端地址（会话中途开始传麦克风时用）
         addr: Option<std::net::SocketAddr>,
-        mods: winit::keyboard::ModifiersState,
         /// 被本地快捷键吃掉的按键：抬起时也不发给远端
         swallowed: HashSet<winit::keyboard::KeyCode>,
         /// 被控端的显示器列表与当前显示的那块
         displays: Vec<rc_protocol::DisplayInfo>,
         current_display: u32,
+        /// 对方的系统（翻译快捷键用）
+        remote_os: Os,
+        /// 本机当前按住的物理键（Windows 上 Win 键被钩子拦下，窗口收不到它的修饰键状态，只能自己记）
+        local_down: HashSet<KeyCode>,
+        /// 远程窗口在前台时拦截本机系统快捷键
+        syskeys: Option<crate::syskeys::SysKeys>,
+        /// 用户按了“交还本机”组合键：在点回远程画面之前不拦截
+        keys_released: bool,
+        /// 正在对方那边切换应用：按住的对方修饰键（本机松开 ⌘ / Alt 时松开它）
+        switching: Option<sc::Scan>,
+        /// Windows：Win 键按下后还没有按别的键（松开时算“单按 Win”）
+        win_tap: bool,
     }
 
     pub fn run(args: ViewArgs) -> Result<()> {
@@ -263,6 +312,10 @@ mod app {
             // 不要默认菜单：否则 Cmd+Q / Cmd+W / Cmd+H 会被本地菜单吃掉，发不到远端。
             .with_default_menu_if_mac()
             .build()?;
+        let args_remote_os = args.host_os.as_deref().and_then(Os::parse).unwrap_or(match Os::LOCAL {
+            Os::Mac => Os::Windows,
+            Os::Windows => Os::Mac,
+        });
         let mut app = App {
             video_size: (conn.width, conn.height),
             host_name: conn.host_name.clone(),
@@ -279,10 +332,15 @@ mod app {
             audio: None,
             mic: None,
             addr: None,
-            mods: Default::default(),
             swallowed: HashSet::new(),
             displays: Vec::new(),
             current_display: 0,
+            remote_os: args_remote_os,
+            local_down: HashSet::new(),
+            syskeys: None,
+            keys_released: false,
+            switching: None,
+            win_tap: false,
         };
         // 主界面通过标准输入发命令：`display <下标>` 切换远端显示器
         {
@@ -294,6 +352,15 @@ mod app {
                         let _ = proxy.send_event(UserEvent::SelectDisplay(i));
                     } else if line.trim() == "paste" {
                         let _ = proxy.send_event(UserEvent::Paste);
+                    } else if let Some(combo) = line.trim().strip_prefix("key ") {
+                        // 测试用：`key SuperLeft+Tab` 依次按下这些键、再倒序松开（等同于在窗口里按这组快捷键）
+                        let keys: Vec<KeyCode> = combo.split('+').filter_map(test_key).collect();
+                        for &k in &keys {
+                            let _ = proxy.send_event(UserEvent::HookKey(k, true));
+                        }
+                        for &k in keys.iter().rev() {
+                            let _ = proxy.send_event(UserEvent::HookKey(k, false));
+                        }
                     }
                 }
             });
@@ -430,6 +497,23 @@ mod app {
                 title_window.set_title(&title);
             });
 
+            // 系统快捷键拦截：拦下的按键经事件循环交回窗口处理
+            if !self.args.local_shortcuts {
+                let proxy = self.proxy.clone();
+                #[cfg(windows)]
+                let hwnd = match window.window_handle()?.as_raw() {
+                    RawWindowHandle::Win32(h) => h.hwnd.get(),
+                    _ => 0,
+                };
+                #[cfg(not(windows))]
+                let hwnd = 0;
+                let on_key = Box::new(move |k, down| {
+                    let _ = proxy.send_event(UserEvent::HookKey(k, down));
+                });
+                let mut keys = crate::syskeys::SysKeys::new(on_key, hwnd);
+                keys.set_active(window.has_focus());
+                self.syskeys = Some(keys);
+            }
             self.window = Some(window);
             self.control = Some(control);
             self.send_viewport();
@@ -522,8 +606,166 @@ mod app {
             normalize_cursor((pos.x, pos.y), (win.width as f64, win.height as f64), self.video_size)
         }
 
+        /// 是否拦截本机系统快捷键（窗口在前台、没有交还本机时）。
+        fn capture_keys(&mut self, on: bool) {
+            let on = on && !self.keys_released;
+            if let Some(k) = &mut self.syskeys {
+                k.set_active(on);
+            }
+        }
+
+        /// 在对方那边按一次组合键：先松开对方当前按着的键，按下组合键，再恢复原来按着的键。
+        fn send_chord(&self, mods: &[sc::Scan], key: sc::Scan) {
+            let key_ev = |(scancode, extended): sc::Scan, down| InputEvent::Key { scancode, extended, down };
+            let held: Vec<sc::Scan> = self.keys_down.iter().copied().collect();
+            for &k in &held {
+                self.send(key_ev(k, false));
+            }
+            for &m in mods {
+                self.send(key_ev(m, true));
+            }
+            self.send(key_ev(key, true));
+            self.send(key_ev(key, false));
+            for &m in mods.iter().rev() {
+                self.send(key_ev(m, false));
+            }
+            for &k in &held {
+                self.send(key_ev(k, true));
+            }
+        }
+
+        /// 一个物理键的按下 / 抬起（来自窗口，或 Windows 键盘钩子）。
+        fn handle_key(&mut self, code: KeyCode, pressed: bool, repeat: bool) {
+            use KeyCode::*;
+            if pressed {
+                self.local_down.insert(code);
+            } else {
+                self.local_down.remove(&code);
+            }
+            let m = sc::Mods::from_keys(&self.local_down);
+            let is_mod = matches!(code, ControlLeft | ControlRight | AltLeft | AltRight | ShiftLeft | ShiftRight | SuperLeft | SuperRight);
+            let key_ev = |(scancode, extended): sc::Scan, down| InputEvent::Key { scancode, extended, down };
+
+            // “交还本机”：⌃⌥⌘（Windows 上 Ctrl+Alt+Win）同时按住，本机快捷键恢复，点回画面再拦截
+            if pressed && !repeat && is_mod && sc::is_release_combo(m) && self.syskeys.is_some() && !self.keys_released {
+                self.keys_released = true;
+                self.capture_keys(false);
+                let click = "点一下远程画面恢复";
+                *self.shared.audio_note.lock().unwrap() = Some(format!("已把系统快捷键交还本机（{click}）"));
+            }
+
+            // 单按 Win（Windows 本机）：对方是 Mac 时换成 ⌘空格（聚焦搜索）
+            if matches!(code, SuperLeft | SuperRight) {
+                if pressed && !repeat {
+                    self.win_tap = true;
+                }
+            } else if pressed {
+                self.win_tap = false;
+            }
+
+            // 切换应用结束：本机松开 ⌘ / Alt，对方松开对应的修饰键
+            if !pressed && sc::is_switch_modifier(Os::LOCAL, code) {
+                if let Some(target) = self.switching.take() {
+                    self.send(key_ev(target, false));
+                    if let Some(s) = keymap::to_scancode(code, self.args.cmd_as_ctrl) {
+                        self.keys_down.remove(&s);
+                    }
+                    return;
+                }
+            }
+
+            // ⌘⇧D（Windows 上 Ctrl+Alt+D）：取回远端复制的文件（本地快捷键，不发给远端）
+            let fetch_mods = if cfg!(target_os = "macos") { m.meta && m.shift } else { m.ctrl && m.alt };
+            if code == KeyD && fetch_mods {
+                if pressed && !repeat {
+                    self.swallowed.insert(code);
+                    if let Some(d) = &self.data {
+                        d.fetch_remote_files();
+                    }
+                }
+                return;
+            }
+            // 粘贴键（Ctrl+V，Mac 上开启“⌘ 当作 Ctrl”时也包括 ⌘V）：本机刚复制了文件时，
+            // 先把文件传到远端（存进“下载”并放进远端剪贴板），传完再在远端按下粘贴
+            let paste_mods = (m.ctrl || (cfg!(target_os = "macos") && self.args.cmd_as_ctrl && m.meta)) && !m.shift && !m.alt;
+            if code == KeyV && paste_mods && pressed && !repeat {
+                if let Some(files) = self.data.as_ref().and_then(|d| d.take_local_files()) {
+                    self.swallowed.insert(code);
+                    self.paste_files(files);
+                    return;
+                }
+            }
+            // ⌃⌥← / ⌃⌥→（Windows 上 Ctrl+Alt+← / →）：切换远端的显示器
+            if matches!(code, ArrowLeft | ArrowRight) && m.ctrl && m.alt && !m.meta && self.displays.len() > 1 {
+                if pressed && !repeat {
+                    self.swallowed.insert(code);
+                    let n = self.displays.len() as u32;
+                    let next = if code == ArrowRight { (self.current_display + 1) % n } else { (self.current_display + n - 1) % n };
+                    self.select_display(next);
+                }
+                return;
+            }
+
+            // 系统快捷键按对方系统的习惯翻译（切应用、切桌面、总览、显示桌面、搜索）
+            if pressed {
+                if let Some(intent) = sc::detect(Os::LOCAL, code, m) {
+                    self.swallowed.insert(code);
+                    match intent {
+                        sc::Intent::AppSwitch { reverse } => {
+                            if self.switching.is_none() {
+                                // 松开对方当前按着的修饰键（例如 ⌘ 对应的 Ctrl），改按对方切换应用用的修饰键
+                                for k in std::mem::take(&mut self.keys_down) {
+                                    self.send(key_ev(k, false));
+                                }
+                                let target = sc::switch_modifier(self.remote_os);
+                                self.send(key_ev(target, true));
+                                self.switching = Some(target);
+                            }
+                            if reverse {
+                                self.send(key_ev(sc::SHIFT_SCAN, true));
+                            }
+                            self.send(key_ev(sc::TAB_SCAN, true));
+                            self.send(key_ev(sc::TAB_SCAN, false));
+                            if reverse {
+                                self.send(key_ev(sc::SHIFT_SCAN, false));
+                            }
+                        }
+                        other if !repeat => {
+                            if let Some((mods, key)) = sc::chord(self.remote_os, other) {
+                                self.send_chord(&mods, key);
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+            }
+            if !pressed && self.swallowed.remove(&code) {
+                return;
+            }
+            let Some((scancode, extended)) = keymap::to_scancode(code, self.args.cmd_as_ctrl) else { return };
+            if pressed {
+                self.keys_down.insert((scancode, extended));
+            } else if !self.keys_down.remove(&(scancode, extended)) {
+                return; // 没发过按下（例如焦点切换时已统一松开），不补发抬起
+            }
+            self.send(InputEvent::Key { scancode, extended, down: pressed });
+
+            // 单按 Win 后松开：对方是 Mac 时打开聚焦搜索（对方是 Windows 时上面已原样发过去，开始菜单会自己弹出）
+            if !pressed && matches!(code, SuperLeft | SuperRight) && std::mem::take(&mut self.win_tap) && Os::LOCAL == Os::Windows && self.remote_os == Os::Mac {
+                if let Some((mods, key)) = sc::chord(self.remote_os, sc::Intent::Search) {
+                    self.send_chord(&mods, key);
+                }
+            }
+        }
+
         /// 松开所有按下的键和鼠标键（失去焦点时调用，防止远端卡键）。
         fn release_all(&mut self) {
+            if let Some(target) = self.switching.take() {
+                self.send(InputEvent::Key { scancode: target.0, extended: target.1, down: false });
+            }
+            self.local_down.clear();
+            self.win_tap = false;
             for (scancode, extended) in std::mem::take(&mut self.keys_down) {
                 self.send(InputEvent::Key { scancode, extended, down: false });
             }
@@ -608,6 +850,10 @@ mod app {
                     self.current_display = current;
                 }
                 UserEvent::SelectDisplay(index) => self.select_display(index),
+                UserEvent::HookKey(code, down) => {
+                    let repeat = down && self.local_down.contains(&code);
+                    self.handle_key(code, down, repeat);
+                }
                 UserEvent::Paste => {
                     if let Some(files) = self.data.as_ref().and_then(|d| d.take_local_files()) {
                         self.paste_files(files);
@@ -641,7 +887,11 @@ mod app {
                     self.shared.alive.store(false, Ordering::Relaxed);
                     event_loop.exit();
                 }
-                WindowEvent::Focused(false) => self.release_all(),
+                WindowEvent::Focused(false) => {
+                    self.capture_keys(false);
+                    self.release_all();
+                }
+                WindowEvent::Focused(true) => self.capture_keys(true),
                 // 包括切换全屏、拖到不同缩放比例的显示器（被控端会去抖）
                 WindowEvent::Resized(_) => self.send_viewport(),
                 WindowEvent::CursorMoved { position, .. } => {
@@ -658,6 +908,12 @@ mod app {
                         MouseButton::Other(_) => return,
                     };
                     let down = state == ElementState::Pressed;
+                    if down && self.keys_released {
+                        // 点回远程画面：重新拦截系统快捷键
+                        self.keys_released = false;
+                        *self.shared.audio_note.lock().unwrap() = None;
+                        self.capture_keys(true);
+                    }
                     if down {
                         self.buttons_down.insert(button);
                     } else {
@@ -682,7 +938,6 @@ mod app {
                         self.send(InputEvent::Wheel { dx: clamp(ix), dy: clamp(iy) });
                     }
                 }
-                WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
                 // 拖进窗口的文件发送到远端“下载”，并放进远端剪贴板
                 WindowEvent::DroppedFile(path) => {
                     if let Some(d) = &self.data {
@@ -691,55 +946,7 @@ mod app {
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
                     let PhysicalKey::Code(code) = event.physical_key else { return };
-                    // ⌘⇧D（Windows 上 Ctrl+Alt+D）：取回远端复制的文件（本地快捷键，不发给远端）
-                    let fetch_mods = if cfg!(target_os = "macos") {
-                        self.mods.super_key() && self.mods.shift_key()
-                    } else {
-                        self.mods.control_key() && self.mods.alt_key()
-                    };
-                    if code == winit::keyboard::KeyCode::KeyD && fetch_mods {
-                        if event.state == ElementState::Pressed && !event.repeat {
-                            self.swallowed.insert(code);
-                            if let Some(d) = &self.data {
-                                d.fetch_remote_files();
-                            }
-                        }
-                        return;
-                    }
-                    // 粘贴键（Ctrl+V，Mac 上开启“⌘ 当作 Ctrl”时也包括 ⌘V）：本机刚复制了文件时，
-                    // 先把文件传到远端（存进“下载”并放进远端剪贴板），传完再在远端按下粘贴
-                    let paste_mods = (self.mods.control_key() || (cfg!(target_os = "macos") && self.args.cmd_as_ctrl && self.mods.super_key()))
-                        && !self.mods.shift_key()
-                        && !self.mods.alt_key();
-                    if code == winit::keyboard::KeyCode::KeyV && paste_mods && event.state == ElementState::Pressed && !event.repeat {
-                        if let Some(files) = self.data.as_ref().and_then(|d| d.take_local_files()) {
-                            self.swallowed.insert(code);
-                            self.paste_files(files);
-                            return;
-                        }
-                    }
-                    // ⌃⌥← / ⌃⌥→（Windows 上 Ctrl+Alt+← / →）：切换远端的显示器
-                    use winit::keyboard::KeyCode::{ArrowLeft, ArrowRight};
-                    if matches!(code, ArrowLeft | ArrowRight) && self.mods.control_key() && self.mods.alt_key() && self.displays.len() > 1 {
-                        if event.state == ElementState::Pressed && !event.repeat {
-                            self.swallowed.insert(code);
-                            let n = self.displays.len() as u32;
-                            let next = if code == ArrowRight { (self.current_display + 1) % n } else { (self.current_display + n - 1) % n };
-                            self.select_display(next);
-                        }
-                        return;
-                    }
-                    if event.state == ElementState::Released && self.swallowed.remove(&code) {
-                        return;
-                    }
-                    let Some((scancode, extended)) = keymap::to_scancode(code, self.args.cmd_as_ctrl) else { return };
-                    let down = event.state == ElementState::Pressed;
-                    if down {
-                        self.keys_down.insert((scancode, extended));
-                    } else if !self.keys_down.remove(&(scancode, extended)) {
-                        return; // 没发过按下（例如焦点切换时已统一松开），不补发抬起
-                    }
-                    self.send(InputEvent::Key { scancode, extended, down });
+                    self.handle_key(code, event.state == ElementState::Pressed, event.repeat);
                 }
                 _ => {}
             }
