@@ -2825,6 +2825,7 @@ dependencies = [
  "clap",
  "cpal",
  "libloading",
+ "objc2 0.6.5",
  "rc-audio",
  "rc-macos",
  "rc-protocol",

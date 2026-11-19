@@ -3,6 +3,7 @@
 //! 需要两项系统权限：“屏幕录制”（采集画面和声音）与“辅助功能”（操作键鼠）。
 
 pub mod clipboard;
+pub mod cursor;
 pub mod input;
 pub mod power;
 mod vt;
@@ -129,6 +130,7 @@ pub struct MacSource {
     pending_key: bool,
     frame_interval: Duration,
     prof: Profile,
+    cursors: cursor::Cursors,
 }
 
 /// 被控端分段耗时，每 5 秒写一行日志，用于定位延迟。
@@ -170,7 +172,8 @@ fn stream_config(w: u32, h: u32, fps: u32) -> SCStreamConfiguration {
         .with_height(h)
         .with_pixel_format(PixelFormat::YCbCr_420v)
         .with_minimum_frame_interval(&CMTime::new(1, fps as i32))
-        .with_shows_cursor(true)
+        // 光标不画进视频：形状发给控制端，由它在本地画（跟手，没有网络延迟）
+        .with_shows_cursor(false)
         .with_queue_depth(4)
 }
 
@@ -231,6 +234,7 @@ impl MacSource {
             pending_key: true,
             frame_interval: Duration::from_secs(1) / fps,
             prof: Profile::new(),
+            cursors: cursor::Cursors::new(),
         })
     }
 }
@@ -297,7 +301,7 @@ impl VideoSource for MacSource {
 
     // 读不到其他应用光标的可靠形状（系统箭头、I 形光标是动态生成的），所以光标直接画在画面里
     fn cursor(&mut self) -> Option<rc_protocol::CursorShape> {
-        Some(rc_protocol::CursorShape::InVideo)
+        Some(self.cursors.current())
     }
 
     fn size(&self) -> (u32, u32) {

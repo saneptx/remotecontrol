@@ -51,6 +51,9 @@ enum Cmd {
     /// 剪贴板助手（由被控端以登录用户身份启动），请勿手动运行
     #[command(hide = true)]
     ClipHelper,
+    /// 调试：每半秒打印一次识别到的光标形状
+    #[command(hide = true)]
+    CursorTest { seconds: u64 },
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -129,6 +132,18 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         Some(Cmd::ClipHelper) => win::cliphelper::helper_main(),
         Some(Cmd::Devices) => list_devices(),
+        #[cfg(target_os = "macos")]
+        Some(Cmd::CursorTest { seconds }) => {
+            mac::cursor::init();
+            let mut c = mac::cursor::Cursors::new();
+            for _ in 0..seconds * 2 {
+                println!("{:?}", c.current());
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        Some(Cmd::CursorTest { .. }) => bail!("只在 macOS 上可用"),
         Some(Cmd::Forget { query }) => {
             let store = trust::Store::open(None)?;
             let removed = store.forget(&query)?;
@@ -181,6 +196,7 @@ fn run_host(args: Args) -> Result<()> {
     if !test_source() {
         mac::power::init(!args.allow_sleep);
         mac::request_permissions();
+        mac::cursor::init();
     }
     let store = Arc::new(trust::Store::open(args.name.clone())?);
 

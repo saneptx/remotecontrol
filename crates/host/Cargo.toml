@@ -17,6 +17,7 @@ bincode = "1.3"
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = { version = "11", features = ["macos_14_0"] }
 rc-macos.workspace = true
+objc2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 cpal = "0.18"
