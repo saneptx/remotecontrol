@@ -206,7 +206,7 @@ fn run_host(args: Args) -> Result<()> {
     println!("等待控制端连接…（新设备首次连接时会在本机弹窗确认）");
 
     // 每个连接一个线程；同一时间只允许一个控制端，其余的收到“正在被控制”的提示。
-    let active: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let active: ActiveState = Arc::new(Mutex::new(None));
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
@@ -267,18 +267,50 @@ fn offer_cable_install(client: &str, alive: &Arc<AtomicBool>, writer: &Arc<Mutex
     }
 }
 
+/// 当前的控制端：名称，以及连上之后它的控制通道（写入端），用于本机用户主动断开。
+struct Active {
+    name: String,
+    writer: Option<Arc<Mutex<TcpStream>>>,
+}
+
+type ActiveState = Arc<Mutex<Option<Active>>>;
+
 /// 占用“当前控制端”名额；析构时释放。
-struct ActiveSlot(Arc<Mutex<Option<String>>>);
+struct ActiveSlot(ActiveState);
 
 impl ActiveSlot {
-    fn claim(active: &Arc<Mutex<Option<String>>>, name: &str) -> Result<Self, String> {
+    fn claim(active: &ActiveState, name: &str) -> Result<Self, String> {
         let mut cur = active.lock().unwrap();
         if let Some(other) = cur.as_ref() {
-            return Err(other.clone());
+            return Err(other.name.clone());
         }
-        *cur = Some(name.to_string());
+        *cur = Some(Active { name: name.to_string(), writer: None });
         Ok(Self(active.clone()))
     }
+}
+
+/// 本机界面发来的请求（只接受本机回环地址）：查询当前控制端，或断开它。
+fn local_request(mut tcp: TcpStream, msg: ClientMsg, active: &ActiveState) -> Result<()> {
+    match msg {
+        ClientMsg::LocalStatus => {
+            // 握手完成（已连上）才算在控制
+            let controller = active.lock().unwrap().as_ref().filter(|a| a.writer.is_some()).map(|a| a.name.clone());
+            proto::write_msg(&mut tcp, &HostMsg::LocalStatus { controller })?;
+        }
+        ClientMsg::LocalDisconnect => {
+            let target = active.lock().unwrap().as_ref().and_then(|a| a.writer.clone().map(|w| (a.name.clone(), w)));
+            if let Some((name, writer)) = target {
+                let mut w = writer.lock().unwrap();
+                let _ = proto::write_msg(&mut *w, &HostMsg::Kicked);
+                // 关闭控制通道：会话的读线程随即出错，整个会话结束
+                let _ = w.shutdown(std::net::Shutdown::Both);
+                println!("本机用户断开了「{name}」的控制");
+            }
+            proto::write_msg(&mut tcp, &HostMsg::LocalStatus { controller: None })?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 impl Drop for ActiveSlot {
@@ -288,7 +320,7 @@ impl Drop for ActiveSlot {
 }
 
 /// 返回 `Ok(false)` 表示对方只是连上就断开（端口探测，例如 `rc-host status`），不记日志。
-fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<Mutex<Option<String>>>) -> Result<bool> {
+fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &ActiveState) -> Result<bool> {
     tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
     let peer = tcp.peer_addr()?;
@@ -303,6 +335,12 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
     if let ClientMsg::DataHello { token } = hello {
         if let Some(tx) = data_waiters().lock().unwrap().remove(&token) {
             let _ = tx.send(tcp);
+        }
+        return Ok(false);
+    }
+    if matches!(hello, ClientMsg::LocalStatus | ClientMsg::LocalDisconnect) {
+        if peer.ip().is_loopback() {
+            local_request(tcp, hello, active)?;
         }
         return Ok(false);
     }
@@ -491,6 +529,10 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
     // 控制端要求切换的显示器：下标 + 1，0 表示没有请求
     let select = Arc::new(AtomicU32::new(0));
     let writer = Arc::new(Mutex::new(tcp.try_clone()?));
+    // 已连上：本机界面可以看到是谁在控制，并能断开它
+    if let Some(a) = active.lock().unwrap().as_mut() {
+        a.writer = Some(writer.clone());
+    }
     // 控制端要传麦克风、本机却没有虚拟声卡：问本机用户要不要装，装好后告诉控制端开始传
     if want_cable {
         let (alive, writer, name) = (alive.clone(), writer.clone(), device_name.clone());

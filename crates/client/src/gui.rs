@@ -167,6 +167,8 @@ struct Gui {
     awdl_outdated: bool,
     awdl_checked: Instant,
     awdl_job: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    /// 正在控制本机的设备名称（后台每秒向本机被控端查询）
+    controller: Arc<Mutex<Option<String>>>,
     /// 本机是否装了虚拟声卡（后台检测，None 表示还没检测完）
     cable: Arc<Mutex<Option<bool>>>,
     cable_job: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
@@ -258,6 +260,21 @@ impl Gui {
                 c
             },
             cable_job: None,
+            controller: {
+                let c: Arc<Mutex<Option<String>>> = Arc::default();
+                let (c2, ctx) = (c.clone(), ctx.clone());
+                std::thread::spawn(move || loop {
+                    let now = net::local_status().ok().flatten();
+                    let mut cur = c2.lock().unwrap();
+                    if *cur != now {
+                        *cur = now;
+                        ctx.request_repaint();
+                    }
+                    drop(cur);
+                    std::thread::sleep(Duration::from_secs(1));
+                });
+                c
+            },
             host,
             host_want,
             job: None,
@@ -708,7 +725,8 @@ impl Gui {
     }
 
     /// 侧边栏底部：本机信息。
-    fn local_card(&self, ui: &mut egui::Ui) {
+    fn local_card(&mut self, ui: &mut egui::Ui) {
+        let mut disconnected = None;
         {
             egui::Frame::new()
                 .fill(Color32::WHITE)
@@ -733,10 +751,33 @@ impl Gui {
                             ui.label(RichText::new(ip).size(12.0).color(kit::TEXT_WEAK));
                         }
                         ui.add_space(4.0);
-                        let (text, dot) = self.host_status();
-                        kit::chip(ui, text, dot);
+                        let controller = self.controller.lock().unwrap().clone();
+                        match controller {
+                            Some(name) => {
+                                kit::chip(ui, "正在被控制", kit::ORANGE);
+                                ui.add(egui::Label::new(RichText::new(&name).size(12.0).color(kit::TEXT)).truncate())
+                                    .on_hover_text(format!("「{name}」正在控制这台电脑"));
+                                ui.add_space(2.0);
+                                if kit::secondary_button(ui, "断开").on_hover_text("断开对方的远程控制").clicked() {
+                                    *self.controller.lock().unwrap() = None;
+                                    std::thread::spawn(|| {
+                                        if let Err(e) = net::local_disconnect() {
+                                            eprintln!("断开失败: {e:#}");
+                                        }
+                                    });
+                                    disconnected = Some(name);
+                                }
+                            }
+                            None => {
+                                let (text, dot) = self.host_status();
+                                kit::chip(ui, text, dot);
+                            }
+                        }
                     });
                 });
+        }
+        if let Some(name) = disconnected {
+            self.say(format!("已断开「{name}」的远程控制"), false);
         }
     }
 

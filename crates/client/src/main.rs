@@ -366,6 +366,8 @@ mod app {
             });
         }
         event_loop.run_app(&mut app)?;
+        // 以错误退出：主界面会把这句话显示给用户
+        anyhow::ensure!(!app.shared.kicked.load(Ordering::Relaxed), "对方电脑上的用户断开了这次远程控制");
         Ok(())
     }
 

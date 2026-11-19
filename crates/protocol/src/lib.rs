@@ -18,7 +18,7 @@ pub mod video;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 pub const DEFAULT_PORT: u16 = 47800;
 /// 局域网发现使用的 UDP 端口。
 pub const DISCOVERY_PORT: u16 = 47801;
@@ -77,6 +77,10 @@ pub enum ClientMsg {
     Viewport { width: u32, height: u32 },
     /// 切换到被控端的第 `index` 块显示器（下标对应 [`HostMsg::Displays`] 的列表）。
     SelectDisplay { index: u32 },
+    /// 本机界面问本机被控端：现在是谁在控制？（新连接的第一条消息，只接受来自本机回环地址的连接）
+    LocalStatus,
+    /// 本机界面让本机被控端断开当前的控制端（同上，只接受本机）。
+    LocalDisconnect,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -112,6 +116,10 @@ pub enum HostMsg {
     Displays { list: Vec<DisplayInfo>, current: u32 },
     /// 会话中途才准备好接收麦克风（刚装好虚拟声卡）：控制端开始往这个 UDP 端口发麦克风声音。
     MicPort { port: u16 },
+    /// 回答 [`ClientMsg::LocalStatus`]：正在控制本机的设备名称（没有则为 None）。
+    LocalStatus { controller: Option<String> },
+    /// 被控端这边的用户断开了这次控制；随后连接关闭。
+    Kicked,
 }
 
 /// 视频编码格式。两端都是 Annex-B 码流、4:2:0、无 B 帧、关键帧带参数集。

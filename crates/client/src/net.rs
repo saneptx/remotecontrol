@@ -45,6 +45,27 @@ pub fn parse_addr(host: &str) -> Result<SocketAddr> {
 }
 
 /// 只做配对（已配对则直接返回）：拿到配对密钥并确认对方接受后立即断开，不打开远程画面。
+/// 问本机被控端：现在是谁在控制本机？（只连本机回环地址）
+pub fn local_status() -> Result<Option<String>> {
+    local_request(ClientMsg::LocalStatus)
+}
+
+/// 让本机被控端断开当前的控制端。
+pub fn local_disconnect() -> Result<()> {
+    local_request(ClientMsg::LocalDisconnect).map(|_| ())
+}
+
+fn local_request(msg: ClientMsg) -> Result<Option<String>> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], proto::DEFAULT_PORT));
+    let mut tcp = TcpStream::connect_timeout(&addr, Duration::from_millis(500))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(2)))?;
+    proto::write_msg(&mut tcp, &msg)?;
+    match proto::read_msg(&mut tcp)? {
+        HostMsg::LocalStatus { controller } => Ok(controller),
+        other => bail!("意外的回复: {other:?}"),
+    }
+}
+
 pub fn pair(addr: SocketAddr, on_event: impl FnMut(HandshakeEvent)) -> Result<()> {
     handshake(addr, on_event, true, None).map(|_| ())
 }
@@ -277,6 +298,8 @@ pub struct Shared {
     pub display_label: Mutex<Option<String>>,
     /// 声音相关的提示（例如麦克风传不过去的原因），显示在窗口标题里。
     pub audio_note: Mutex<Option<String>>,
+    /// 对方电脑上的用户主动断开了这次控制
+    pub kicked: AtomicBool,
 }
 
 /// 读控制通道：处理 Pong 估算时钟差；连接断开时调用 `on_closed`。
@@ -297,6 +320,8 @@ pub fn spawn_control_reader(
                 on_displays(list, current);
             } else if let HostMsg::MicPort { port } = msg {
                 on_mic_port(port);
+            } else if let HostMsg::Kicked = msg {
+                shared.kicked.store(true, Ordering::Relaxed);
             } else if let HostMsg::Notice { text } = msg {
                 match &text {
                     Some(t) => eprintln!("被控端: {t}"),
