@@ -3,7 +3,9 @@
 # 用法：packaging/macos/make-app.sh [--install]   --install 时复制到 /Applications
 set -euo pipefail
 # 出错时报出行号和命令；在 GitHub Actions 里以 ::error:: 注释显示（不登录也能看到）
+set -E
 trap 'echo "::error::make-app.sh 第 $LINENO 行失败（退出码 $?）：$BASH_COMMAND"' ERR
+trap 'rc=$?; [ $rc -ne 0 ] && echo "::error::make-app.sh 退出码 $rc，最后的命令：$BASH_COMMAND"' EXIT
 cd "$(dirname "$0")/../.."
 export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
 
@@ -41,6 +43,7 @@ PLIST
 # 签名：有本地证书（packaging/macos/create-signing-cert.sh 创建）就用它，否则临时签名。
 # 临时签名每次编译都会变，macOS 会把之前给的“辅助功能”“录屏”授权当作别的程序；固定证书签名则一直有效。
 IDENTITY="SuperControl Local Signing"
+[ -n "${GITHUB_ACTIONS:-}" ] && echo "::notice::find-identity: $(security find-identity -p codesigning 2>&1 | tr '\n' ' ')"
 if ! security find-identity -p codesigning | grep -q "\"$IDENTITY\""; then
     echo "提示：没有找到证书「$IDENTITY」，使用临时签名（每次更新后需要重新授权）。运行 packaging/macos/create-signing-cert.sh 创建" >&2
     IDENTITY=-
