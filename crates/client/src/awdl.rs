@@ -20,9 +20,9 @@ fn flag() -> std::path::PathBuf {
     crate::config::config_dir().join("awdl-guard.on")
 }
 
-/// 已安装的守护不认开关文件（旧版本），切换开关前需要重新安装一次。
-fn guard_outdated() -> bool {
-    std::fs::read_to_string("/usr/local/libexec/remotecontrol-awdl-guard").map(|s| !s.contains("FLAG=")).unwrap_or(true)
+/// 已安装的守护是旧版本（不认开关文件，或本机被控制时不生效），需要重新安装一次。
+pub fn guard_outdated() -> bool {
+    std::fs::read_to_string("/usr/local/libexec/remotecontrol-awdl-guard").map(|s| !s.contains("host-session")).unwrap_or(true)
 }
 
 /// 界面上的开关状态。

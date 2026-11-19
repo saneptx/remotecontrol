@@ -128,6 +128,40 @@ pub struct MacSource {
     area: Area,
     pending_key: bool,
     frame_interval: Duration,
+    prof: Profile,
+}
+
+/// 被控端分段耗时，每 5 秒写一行日志，用于定位延迟。
+struct Profile {
+    since: Instant,
+    frames: u32,
+    /// 画面送到 → 开始编码
+    wait: Duration,
+    encode: Duration,
+}
+
+impl Profile {
+    fn new() -> Self {
+        Self { since: Instant::now(), frames: 0, wait: Duration::ZERO, encode: Duration::ZERO }
+    }
+
+    fn add(&mut self, capture_us: u64, encode_start: Instant) {
+        self.frames += 1;
+        self.encode += encode_start.elapsed();
+        let start_us = now_us().saturating_sub(encode_start.elapsed().as_micros() as u64);
+        self.wait += Duration::from_micros(start_us.saturating_sub(capture_us));
+        let elapsed = self.since.elapsed();
+        if elapsed >= Duration::from_secs(5) {
+            let avg = |d: Duration| d.as_secs_f64() * 1000.0 / self.frames as f64;
+            println!(
+                "性能: {:.0} fps，等待 {:.1} ms，编码 {:.1} ms",
+                self.frames as f64 / elapsed.as_secs_f64(),
+                avg(self.wait),
+                avg(self.encode)
+            );
+            *self = Self::new();
+        }
+    }
 }
 
 fn stream_config(w: u32, h: u32, fps: u32) -> SCStreamConfiguration {
@@ -196,6 +230,7 @@ impl MacSource {
             area: Arc::new(Mutex::new(display_bounds(display))),
             pending_key: true,
             frame_interval: Duration::from_secs(1) / fps,
+            prof: Profile::new(),
         })
     }
 }
@@ -313,7 +348,9 @@ impl VideoSource for MacSource {
             None if self.pending_key && self.last.is_some() => (self.last.clone().unwrap(), now_us()),
             None => return Ok(None),
         };
+        let t0 = Instant::now();
         let out = self.enc.encode(pb.as_ptr(), capture_us, self.pending_key)?;
+        self.prof.add(capture_us, t0);
         self.last = Some(pb);
         let Some((data, keyframe)) = out else { return Ok(None) };
         if keyframe {

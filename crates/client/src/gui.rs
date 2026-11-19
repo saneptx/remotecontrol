@@ -163,6 +163,8 @@ struct Gui {
     settings: config::Settings,
     awdl_guard: bool,
     awdl_active: bool,
+    /// AWDL 守护是旧版（本机被控制时不生效），需要重新安装
+    awdl_outdated: bool,
     awdl_checked: Instant,
     awdl_job: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     /// 本机是否装了虚拟声卡（后台检测，None 表示还没检测完）
@@ -246,6 +248,7 @@ impl Gui {
             settings,
             awdl_guard: awdl::enabled(),
             awdl_active: awdl::active(),
+            awdl_outdated: awdl::guard_installed() && awdl::guard_outdated(),
             awdl_checked: Instant::now(),
             awdl_job: None,
             cable: {
@@ -478,6 +481,7 @@ impl Gui {
             if let Ok(r) = rx.try_recv() {
                 self.awdl_job = None;
                 self.awdl_guard = awdl::enabled();
+                self.awdl_outdated = awdl::guard_installed() && awdl::guard_outdated();
                 if let Err(e) = r {
                     self.say(format!("设置 AWDL 自动处理失败：{e}"), true);
                 }
@@ -498,6 +502,7 @@ impl Gui {
         if self.awdl_checked.elapsed() > Duration::from_secs(2) {
             self.awdl_checked = Instant::now();
             self.awdl_active = awdl::active();
+            self.awdl_outdated = awdl::guard_installed() && awdl::guard_outdated();
         }
         if self.ip_checked.elapsed() > Duration::from_secs(10) {
             self.ip_checked = Instant::now();
@@ -1150,7 +1155,7 @@ impl Gui {
                 kit::setting_row(
                     ui,
                     "远程期间自动关闭 AWDL",
-                    "AWDL 是隔空投送、接力使用的无线通道，会让 Wi-Fi 周期性卡顿几十毫秒。只在远程画面打开期间关闭；第一次开启需要输入一次管理员密码",
+                    "AWDL 是隔空投送、接力使用的无线通道，会让 Wi-Fi 周期性卡顿几十毫秒。只在本机控制别人或被控制期间关闭；第一次开启需要输入一次管理员密码",
                     200.0,
                     |ui| {
                         let resp = ui.add_enabled(!pending, Toggle(&mut guard));
@@ -1163,6 +1168,19 @@ impl Gui {
                             std::thread::spawn(move || {
                                 let _ = tx.send(awdl::set_enabled(guard).map_err(|e| format!("{e:#}")));
                             });
+                        }
+                        if guard && self.awdl_outdated && !pending {
+                            // 旧版守护只在本机控制别人时生效；更新后本机被控制时也会关闭 AWDL
+                            if kit::secondary_button(ui, "更新")
+                                .on_hover_text("当前版本只在本机控制别人时关闭 AWDL；更新后本机被控制时也会关闭（需要输入一次管理员密码）")
+                                .clicked()
+                            {
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                self.awdl_job = Some(rx);
+                                std::thread::spawn(move || {
+                                    let _ = tx.send(awdl::set_enabled(true).map_err(|e| format!("{e:#}")));
+                                });
+                            }
                         }
                         if self.awdl_active {
                             kit::chip(ui, "AWDL 开启中", kit::ORANGE);

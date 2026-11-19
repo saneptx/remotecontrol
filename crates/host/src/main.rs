@@ -441,6 +441,20 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Arc<M
 
     // ---- 控制通道读线程：输入事件、关键帧请求、心跳 ----
     let alive = Arc::new(AtomicBool::new(true));
+    // macOS：会话期间每秒刷新一个标记文件，AWDL 守护（界面里“远程期间自动关闭 AWDL”）据此在本机被控制时也关闭 AWDL，
+    // 否则 Wi-Fi 每隔几秒卡顿上百毫秒。标记 5 秒不刷新即视为结束（被控端崩溃也不会一直压着 AWDL）
+    #[cfg(target_os = "macos")]
+    {
+        let alive = alive.clone();
+        std::thread::spawn(move || {
+            let marker = trust::config_dir().join("host-session");
+            while alive.load(Ordering::Relaxed) {
+                let _ = std::fs::write(&marker, b"");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            let _ = std::fs::remove_file(&marker);
+        });
+    }
     if let Some(a) = audio_udp {
         audio::spawn(a, alive.clone());
     }

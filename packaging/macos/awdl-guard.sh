@@ -3,7 +3,7 @@
 #
 # AWDL 会让 Wi-Fi 网卡周期性跳到其它信道，造成几十到上百毫秒的停顿，是 Wi-Fi 下
 # 远程画面延迟尖峰的主要来源；macOS 会在附近有苹果设备时自动重新打开它。
-# 本脚本安装一个后台守护：只要有远程画面窗口（rc-client view）在运行，就保持 awdl0 关闭；退出后
+# 本脚本安装一个后台守护：只要有远程画面窗口（rc-client view）在运行、或本机正被控制，就保持 awdl0 关闭；结束后
 # 不再干预（系统会按需重新打开，AirDrop 等功能照常可用）。
 #
 # 守护只需安装一次（需要 root）。带开关文件参数安装时，只有该文件存在才干预——SuperControl 界面里的
@@ -31,9 +31,17 @@ install)
     need_root install
     mkdir -p "$(dirname "$BIN")"
     { printf '#!/bin/bash\nFLAG=%q\n' "${2:-}"; cat <<'GUARD'
-# 每秒检查一次：开关打开（FLAG 为空或文件存在）、有远程画面窗口在运行且 awdl0 处于开启状态时把它关掉。
+# 本机被控制时，被控端每秒刷新这个文件（和开关文件在同一目录）；5 秒没刷新视为会话已结束
+SESSION=""
+[ -n "$FLAG" ] && SESSION="$(dirname "$FLAG")/host-session"
+# 有远程画面窗口在运行（本机在控制别人），或本机正被控制
+busy() {
+    pgrep -qf "rc-client view" && return 0
+    [ -n "$SESSION" ] && [ -n "$(find "$SESSION" -mtime -5s 2>/dev/null)" ]
+}
+# 每秒检查一次：开关打开（FLAG 为空或文件存在）、正在远程且 awdl0 处于开启状态时把它关掉。
 while true; do
-    if { [ -z "$FLAG" ] || [ -e "$FLAG" ]; } && pgrep -qf "rc-client view" && ifconfig awdl0 2>/dev/null | head -1 | grep -q "<UP"; then
+    if { [ -z "$FLAG" ] || [ -e "$FLAG" ]; } && busy && ifconfig awdl0 2>/dev/null | head -1 | grep -q "<UP"; then
         ifconfig awdl0 down
     fi
     sleep 1
