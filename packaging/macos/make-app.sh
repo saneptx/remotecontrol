@@ -2,6 +2,8 @@
 # 构建并打包成 SuperControl.app（输出到 target/SuperControl.app）。
 # 用法：packaging/macos/make-app.sh [--install]   --install 时复制到 /Applications
 set -euo pipefail
+# 出错时报出行号和命令；在 GitHub Actions 里以 ::error:: 注释显示（不登录也能看到）
+trap 'echo "::error::make-app.sh 第 $LINENO 行失败（退出码 $?）：$BASH_COMMAND"' ERR
 cd "$(dirname "$0")/../.."
 export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
 
