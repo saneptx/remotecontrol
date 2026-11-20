@@ -761,6 +761,27 @@ mod app {
             }
         }
 
+        /// 让记录的修饰键和系统报告的修饰键状态一致：少了就补按左侧键，多了就补抬起。
+        #[cfg(target_os = "macos")]
+        fn sync_modifiers(&mut self, state: winit::keyboard::ModifiersState) {
+            use KeyCode::*;
+            for (on, left, right) in [
+                (state.super_key(), SuperLeft, SuperRight),
+                (state.control_key(), ControlLeft, ControlRight),
+                (state.alt_key(), AltLeft, AltRight),
+                (state.shift_key(), ShiftLeft, ShiftRight),
+            ] {
+                let held: Vec<KeyCode> = [left, right].into_iter().filter(|k| self.local_down.contains(k)).collect();
+                if on && held.is_empty() {
+                    self.handle_key(left, true, false);
+                } else if !on {
+                    for k in held {
+                        self.handle_key(k, false, false);
+                    }
+                }
+            }
+        }
+
         /// 松开所有按下的键和鼠标键（失去焦点时调用，防止远端卡键）。
         fn release_all(&mut self) {
             if let Some(target) = self.switching.take() {
@@ -946,6 +967,10 @@ mod app {
                         d.drop_file(path);
                     }
                 }
+                // macOS：系统快捷键被关闭（见 syskeys）时，⌘ 等修饰键的 flagsChanged 不带键码，
+                // winit 只报修饰键状态、不报按键，这里按状态补上修饰键的按下 / 抬起
+                #[cfg(target_os = "macos")]
+                WindowEvent::ModifiersChanged(m) => self.sync_modifiers(m.state()),
                 WindowEvent::KeyboardInput { event, .. } => {
                     let PhysicalKey::Code(code) = event.physical_key else { return };
                     self.handle_key(code, event.state == ElementState::Pressed, event.repeat);
