@@ -99,8 +99,8 @@ fn worker_args(args: &Args) -> Vec<String> {
         v.push("--encoder".into());
         v.push(format!("{:?}", args.encoder).to_lowercase());
     }
-    if args.allow_sleep {
-        v.push("--allow-sleep".into());
+    if args.prevent_sleep {
+        v.push("--prevent-sleep".into());
     }
     v
 }

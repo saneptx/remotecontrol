@@ -15,6 +15,9 @@ pub struct KnownHost {
     /// 上次成功连接的地址（ip:port），用于手动连接或发现不到时直接连。
     #[serde(default)]
     pub last_addr: Option<String>,
+    /// 对方物理网卡的硬件地址（发现时由对方告知），对方睡眠后用来发网络唤醒包
+    #[serde(default)]
+    pub macs: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -140,8 +143,21 @@ pub fn key_for(host_id: &DeviceId) -> Option<Key> {
 pub fn remember(host_id: &DeviceId, name: &str, key: &Key, addr: &str) -> Result<()> {
     let mut f = read();
     let hex = proto::hex(host_id);
+    let macs = f.hosts.iter().find(|h| h.id == hex).map(|h| h.macs.clone()).unwrap_or_default();
     f.hosts.retain(|h| h.id != hex);
-    f.hosts.push(KnownHost { id: hex, name: name.into(), key: proto::hex(key), last_addr: Some(addr.into()) });
+    f.hosts.push(KnownHost { id: hex, name: name.into(), key: proto::hex(key), last_addr: Some(addr.into()), macs });
+    write(&f)
+}
+
+/// 记下已配对设备的网卡地址（变化时才写文件）。
+pub fn remember_macs(host_id: &DeviceId, macs: &[[u8; 6]]) -> Result<()> {
+    let mut f = read();
+    let hex = proto::hex(host_id);
+    let macs: Vec<String> = macs.iter().map(proto::discovery::format_mac).collect();
+    match f.hosts.iter_mut().find(|h| h.id == hex) {
+        Some(h) if h.macs != macs => h.macs = macs,
+        _ => return Ok(()),
+    }
     write(&f)
 }
 

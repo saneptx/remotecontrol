@@ -150,6 +150,10 @@ struct CardInfo {
     forget_id: Option<String>,
     /// 已经在控制这台电脑（连接按钮不可点）
     connected: bool,
+    /// 离线且知道网卡地址时可以唤醒：(设备 ID, 网卡地址, 上次的 IP)
+    wake: Option<(String, Vec<[u8; 6]>, Option<std::net::IpAddr>)>,
+    /// 刚发过唤醒包，正在等它上线
+    waking: bool,
 }
 
 struct Gui {
@@ -167,6 +171,8 @@ struct Gui {
     awdl_outdated: bool,
     awdl_checked: Instant,
     awdl_job: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    /// 发过唤醒包、正在等待上线的设备：设备 ID → (名称, 开始时间)
+    waking: HashMap<String, (String, Instant)>,
     /// 正在控制本机的设备名称（后台每秒向本机被控端查询）
     controller: Arc<Mutex<Option<String>>>,
     /// 本机是否装了虚拟声卡（后台检测，None 表示还没检测完）
@@ -253,6 +259,7 @@ impl Gui {
             awdl_outdated: awdl::guard_installed() && awdl::guard_outdated(),
             awdl_checked: Instant::now(),
             awdl_job: None,
+            waking: HashMap::new(),
             cable: {
                 let c: Arc<Mutex<Option<bool>>> = Arc::default();
                 let c2 = c.clone();
@@ -357,6 +364,50 @@ impl Gui {
         }
     }
 
+    /// 唤醒的设备上线了就提示成功；等太久没上线就提示失败。
+    fn poll_waking(&mut self) {
+        if self.waking.is_empty() {
+            return;
+        }
+        let online: Vec<String> = {
+            let now = Instant::now();
+            let seen = self.seen.lock().unwrap();
+            seen.values().filter(|s| now - s.at < Duration::from_secs(8)).map(|s| proto::hex(&s.host.host_id)).collect()
+        };
+        let mut done = Vec::new();
+        for (id, (name, at)) in &self.waking {
+            if online.contains(id) {
+                done.push((id.clone(), format!("「{name}」已唤醒，可以连接了"), false));
+            } else if at.elapsed() > WAKE_TIMEOUT {
+                done.push((
+                    id.clone(),
+                    format!("「{name}」没有响应：可能已关机、断开了网络，或网卡不支持网络唤醒"),
+                    true,
+                ));
+            }
+        }
+        for (id, text, error) in done {
+            self.waking.remove(&id);
+            self.say(text, error);
+        }
+    }
+
+    /// 发网络唤醒包：睡眠中的网卡可能漏收，前 20 秒里多发几次。
+    fn wake(&mut self, ctx: &egui::Context, name: String, id: String, macs: Vec<[u8; 6]>, ip: Option<std::net::IpAddr>) {
+        self.waking.insert(id, (name.clone(), Instant::now()));
+        self.say(format!("已向「{name}」发送唤醒信号，正在等待它上线…"), false);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            for delay in [0, 2, 3, 5, 10] {
+                std::thread::sleep(Duration::from_secs(delay));
+                if let Err(e) = net::wake(&macs, ip) {
+                    eprintln!("发送唤醒包失败: {e:#}");
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
     fn say(&mut self, text: impl Into<String>, error: bool) {
         self.message = Some((text.into(), error, Instant::now()));
     }
@@ -444,6 +495,7 @@ impl Gui {
 
     /// 处理后台任务的结果、回收已退出的画面窗口。
     fn poll(&mut self) {
+        self.poll_waking();
         if let Some(job) = &self.job {
             let mut guard = job.lock().unwrap();
             match std::mem::replace(
@@ -956,6 +1008,7 @@ impl Gui {
         let busy = self.busy();
         let mut action = None;
         let mut forget = None;
+        let mut wake = None;
         for row in cards.chunks(cols) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
@@ -964,7 +1017,12 @@ impl Gui {
                         Vec2::new(card_w, 0.0),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
-                            let (connect, forget_it) = device_card(ui, c, card_w, busy);
+                            let (connect, forget_it, wake_it) = device_card(ui, c, card_w, busy);
+                            if wake_it {
+                                if let Some((id, macs, ip)) = &c.wake {
+                                    wake = Some((c.name.clone(), id.clone(), macs.clone(), *ip));
+                                }
+                            }
                             if connect {
                                 if let Some((id, addr, os)) = &c.target {
                                     action = Some((c.name.clone(), *id, *addr, os.clone()));
@@ -981,6 +1039,9 @@ impl Gui {
         }
         if let Some((name, id, addr, os)) = action {
             self.connect(&ctx, name, id, addr, os);
+        }
+        if let Some((name, id, macs, ip)) = wake {
+            self.wake(&ctx, name, id, macs, ip);
         }
         if let Some(id) = forget {
             let _ = config::forget(&id);
@@ -1019,6 +1080,8 @@ impl Gui {
                 target: Some((Some(d.host_id), d.addr, Some(d.os.clone()))),
                 forget_id: d.paired.then(|| proto::hex(&d.host_id)),
                 connected: self.is_connected(Some(d.host_id), d.addr),
+                wake: None,
+                waking: false,
             })
             .collect();
         for k in config::known_hosts() {
@@ -1038,6 +1101,11 @@ impl Gui {
                 target: parsed.map(|a| (proto::parse_hex16(&k.id), a, None)),
                 forget_id: Some(k.id.clone()),
                 connected: parsed.is_some_and(|a| self.is_connected(id, a)),
+                wake: {
+                    let macs: Vec<[u8; 6]> = k.macs.iter().filter_map(|m| proto::discovery::parse_mac(m)).collect();
+                    (!macs.is_empty()).then(|| (k.id.clone(), macs, parsed.map(|a| a.ip())))
+                },
+                waking: self.waking.contains_key(&k.id),
             });
         }
         cards
@@ -1490,9 +1558,12 @@ impl Gui {
     }
 }
 
-/// 设备卡片。返回 (点了连接, 点了忘记)。
-fn device_card(ui: &mut egui::Ui, c: &CardInfo, width: f32, busy: bool) -> (bool, bool) {
-    let (mut connect, mut forget) = (false, false);
+/// 唤醒后等它上线的最长时间
+const WAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 设备卡片。返回 (点了连接, 点了忘记, 点了唤醒)。
+fn device_card(ui: &mut egui::Ui, c: &CardInfo, width: f32, busy: bool) -> (bool, bool, bool) {
+    let (mut connect, mut forget, mut wake) = (false, false, false);
     kit::card().show(ui, |ui| {
         ui.set_width(width - 34.0);
         ui.horizontal(|ui| {
@@ -1514,7 +1585,9 @@ fn device_card(ui: &mut egui::Ui, c: &CardInfo, width: f32, busy: bool) -> (bool
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            if !c.online {
+            if c.waking {
+                kit::chip(ui, "正在唤醒…", kit::ORANGE);
+            } else if !c.online {
                 kit::chip(ui, "离线", kit::GRAY);
             } else if !c.compatible {
                 kit::chip(ui, "版本不一致", kit::ORANGE);
@@ -1553,6 +1626,14 @@ fn device_card(ui: &mut egui::Ui, c: &CardInfo, width: f32, busy: bool) -> (bool
             {
                 connect = true;
             }
+            if c.wake.is_some()
+                && !c.waking
+                && kit::secondary_button(ui, "唤醒")
+                    .on_hover_text("对方睡眠时发送网络唤醒信号（需要对方网卡支持网络唤醒）")
+                    .clicked()
+            {
+                wake = true;
+            }
             if c.forget_id.is_some() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if kit::text_button(ui, "忘记", kit::TEXT_FAINT)
@@ -1565,7 +1646,7 @@ fn device_card(ui: &mut egui::Ui, c: &CardInfo, width: f32, busy: bool) -> (bool
             }
         });
     });
-    (connect, forget)
+    (connect, forget, wake)
 }
 
 impl eframe::App for Gui {
@@ -1647,6 +1728,12 @@ fn spawn_scanner(seen: Arc<Mutex<HashMap<DeviceId, Seen>>>, ctx: egui::Context) 
                 .into_iter()
                 .filter(|h| !h.addr.ip().is_loopback() && !local.contains(&h.addr.ip()))
             {
+                if host.paired {
+                    let macs = if host.macs.is_empty() { net::neighbor_mac(host.addr.ip()).into_iter().collect() } else { host.macs.clone() };
+                    if !macs.is_empty() {
+                        let _ = config::remember_macs(&host.host_id, &macs);
+                    }
+                }
                 map.insert(host.host_id, Seen { host, at: now });
             }
             map.retain(|_, s| now - s.at < Duration::from_secs(30));

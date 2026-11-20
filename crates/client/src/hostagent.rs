@@ -43,9 +43,9 @@ pub fn spawn() -> Result<Child> {
         let _ = std::fs::rename(&log, log.with_extension("old.log"));
     }
     let file = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
-    // Mac 多为笔记本：允许睡眠（--allow-sleep），只在有连接时保持唤醒
+    // 默认按系统设置睡眠，只在有连接时保持唤醒
     Command::new(bin)
-        .args(["--allow-sleep", "--exit-with-parent"])
+        .args(["--exit-with-parent"])
         .stdin(Stdio::null())
         .stdout(file.try_clone()?)
         .stderr(file)

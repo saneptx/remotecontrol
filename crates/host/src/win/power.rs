@@ -17,7 +17,9 @@ pub fn init(prevent_sleep: bool) {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
         if prevent_sleep {
             SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
-            println!("运行期间将阻止系统睡眠（显示器仍可按设置关闭）；如需允许睡眠请加 --allow-sleep");
+            println!("运行期间将阻止系统睡眠（显示器仍可按设置关闭）");
+        } else {
+            println!("本机按系统设置睡眠，有人连接时保持唤醒");
         }
     }
     PREVENT_SLEEP.store(prevent_sleep, Ordering::Relaxed);

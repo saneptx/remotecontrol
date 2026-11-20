@@ -3,6 +3,7 @@
 mod audio;
 mod clip;
 mod mute;
+mod netif;
 mod source;
 mod trust;
 #[cfg(not(windows))]
@@ -73,8 +74,12 @@ pub struct Args {
     /// 前向纠错冗余比例（%）。Wi-Fi 下建议 20 以上，有线网络可降到 5～10，0 为关闭
     #[arg(long, default_value_t = 20)]
     pub fec: u32,
-    /// 允许系统按电源设置进入睡眠（默认被控端运行期间阻止睡眠，否则睡眠后无法连接）
+    /// 被控端运行期间一直阻止系统睡眠。默认按系统电源设置睡眠：有人连接时保持唤醒，
+    /// 睡眠后控制端可以用网络唤醒（Wake-on-LAN）叫醒本机
     #[arg(long)]
+    pub prevent_sleep: bool,
+    /// 旧版参数（现在默认就允许睡眠），保留以兼容旧的启动命令
+    #[arg(long, hide = true)]
     pub allow_sleep: bool,
     /// 测试用：随机丢弃该比例（%）的视频包，模拟网络丢包
     #[arg(long, hide = true, default_value_t = 0.0)]
@@ -191,10 +196,10 @@ fn run_host(args: Args) -> Result<()> {
         });
     }
     #[cfg(windows)]
-    win::power::init(!args.allow_sleep);
+    win::power::init(args.prevent_sleep);
     #[cfg(target_os = "macos")]
     if !test_source() {
-        mac::power::init(!args.allow_sleep);
+        mac::power::init(args.prevent_sleep);
         mac::request_permissions();
         mac::cursor::init();
     }
@@ -488,9 +493,11 @@ fn session(mut tcp: TcpStream, args: &Args, store: &trust::Store, active: &Activ
         mic_port: mic_sock.as_ref().and_then(|(s, _)| s.local_addr().ok()).map(|a| a.port()).unwrap_or(0),
     };
     proto::write_msg(&mut tcp, &welcome)?;
-    // 会话期间保持显示器常亮
+    // 会话期间保持系统和显示器唤醒
     #[cfg(windows)]
     let _awake = win::power::SessionAwake::new();
+    #[cfg(target_os = "macos")]
+    let _awake = mac::power::SessionAwake::new();
     tcp.set_read_timeout(None)?;
 
     // ---- 控制通道读线程：输入事件、关键帧请求、心跳 ----
@@ -683,7 +690,7 @@ fn spawn_discovery(store: Arc<trust::Store>, port: u16) {
             let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
             let Some(probe) = proto::discovery::decode_probe(&buf[..n]) else { continue };
             let paired = store.key_for(&probe.device_id).is_some();
-            let reply = proto::discovery::Announce::new(store.host_id(), store.host_name().to_string(), os, port, paired);
+            let reply = proto::discovery::Announce::new(store.host_id(), store.host_name().to_string(), os, port, paired, netif::physical_macs());
             let _ = sock.send_to(&proto::discovery::encode(&reply), from);
         }
     });

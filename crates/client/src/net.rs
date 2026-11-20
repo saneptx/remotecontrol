@@ -210,13 +210,11 @@ pub struct Discovered {
     pub addr: SocketAddr,
     pub paired: bool,
     pub version: u32,
+    pub macs: Vec<[u8; 6]>,
 }
 
-/// 向本机各网卡的子网广播探测包，收集 `wait` 时间内的回复。
-pub fn discover(wait: Duration) -> Result<Vec<Discovered>> {
-    let probe = proto::discovery::encode(&proto::discovery::Probe::new(config::device_id()?));
-    let sock = UdpSocket::bind("0.0.0.0:0")?;
-    sock.set_broadcast(true)?;
+/// 本机各网卡的子网广播地址，加上 255.255.255.255。
+fn broadcast_targets() -> Vec<std::net::Ipv4Addr> {
     let mut targets: Vec<std::net::Ipv4Addr> = vec![std::net::Ipv4Addr::BROADCAST];
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
         if let if_addrs::IfAddr::V4(v4) = iface.addr {
@@ -227,7 +225,69 @@ pub fn discover(wait: Duration) -> Result<Vec<Discovered>> {
             }
         }
     }
-    for t in &targets {
+    targets
+}
+
+/// 发网络唤醒包（Wake-on-LAN）：向各子网广播，并直接发给对方上次的地址；端口 9 和 7 都发。
+/// 睡眠中的网卡只认包里的硬件地址，不看端口和目标 IP。
+pub fn wake(macs: &[[u8; 6]], last_ip: Option<std::net::IpAddr>) -> Result<()> {
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    sock.set_broadcast(true)?;
+    let mut targets: Vec<std::net::IpAddr> = broadcast_targets().into_iter().map(Into::into).collect();
+    targets.extend(last_ip);
+    let mut sent = 0;
+    for mac in macs {
+        let pkt = proto::discovery::magic_packet(mac);
+        for t in &targets {
+            for port in [9, 7] {
+                if sock.send_to(&pkt, (*t, port)).is_ok() {
+                    sent += 1;
+                }
+            }
+        }
+    }
+    anyhow::ensure!(sent > 0, "唤醒包发送失败");
+    Ok(())
+}
+
+/// 从本机的 ARP 表里查对方的网卡地址。用于对方没有报出自己网卡地址的情况
+/// （macOS 不让普通程序读真实网卡地址）。刚和对方收发过包，表里一定有它。
+#[cfg(windows)]
+pub fn neighbor_mac(ip: std::net::IpAddr) -> Option<[u8; 6]> {
+    use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIpNetTable2, MIB_IPNET_TABLE2};
+    use windows::Win32::Networking::WinSock::AF_INET;
+    let std::net::IpAddr::V4(ip) = ip else { return None };
+    unsafe {
+        let mut table: *mut MIB_IPNET_TABLE2 = std::ptr::null_mut();
+        if GetIpNetTable2(AF_INET, &mut table).is_err() || table.is_null() {
+            return None;
+        }
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
+        let found = rows.iter().find_map(|r| {
+            let addr = std::net::Ipv4Addr::from(u32::from_be(r.Address.Ipv4.sin_addr.S_un.S_addr));
+            // 状态 4 = 过期（仍然有效），5 = 可达
+            (addr == ip && r.PhysicalAddressLength == 6 && r.State.0 >= 4).then(|| {
+                let mut mac = [0u8; 6];
+                mac.copy_from_slice(&r.PhysicalAddress[..6]);
+                mac
+            })
+        });
+        FreeMibTable(table as *const _);
+        found.filter(|m| *m != [0; 6] && m[0] & 1 == 0)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn neighbor_mac(_ip: std::net::IpAddr) -> Option<[u8; 6]> {
+    None
+}
+
+/// 向本机各网卡的子网广播探测包，收集 `wait` 时间内的回复。
+pub fn discover(wait: Duration) -> Result<Vec<Discovered>> {
+    let probe = proto::discovery::encode(&proto::discovery::Probe::new(config::device_id()?));
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    sock.set_broadcast(true)?;
+    for t in &broadcast_targets() {
         let _ = sock.send_to(&probe, (*t, proto::DISCOVERY_PORT));
     }
 
@@ -252,6 +312,7 @@ pub fn discover(wait: Duration) -> Result<Vec<Discovered>> {
             addr: SocketAddr::new(from.ip(), a.port),
             paired: a.paired && config::key_for(&a.host_id).is_some(),
             version: a.version,
+            macs: a.macs,
         });
     }
     found.sort_by(|a, b| a.name.cmp(&b.name));
